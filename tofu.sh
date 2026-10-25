@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
+umask 077
+
 export LANG=en_US.UTF-8
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
-blue='\033[0;34m'
-purple='\033[0;35m'
 cyan='\033[0;36m'
 plain='\033[0m'
 bold='\033[1m'
@@ -17,17 +17,31 @@ CONFIG_FILE="${CONFIG_DIR}/config.json"
 DATA_FILE="${CONFIG_DIR}/node_info.env"
 NODES_TXT="${CONFIG_DIR}/nodes.txt"
 IPTABLES_SCRIPT="${CONFIG_DIR}/iptables.sh"
+SYSTEM_STATE_FILE="${CONFIG_DIR}/system_state.tsv"
 XRAY_BIN="/usr/local/bin/xray"
 TOFU_BIN="/usr/local/bin/tofu"
 SYSTEMD_FILE="/etc/systemd/system/tofu.service"
 OPENRC_FILE="/etc/init.d/tofu"
+FALLBACK_PID_FILE="/run/tofu.pid"
 
 DEFAULT_REALITY_PORT=443
 DEFAULT_HY2_PORT=8443
 DEFAULT_XHTTP_PORT=2053
-DEFAULT_HOP_START=20000
-DEFAULT_HOP_END=40000
-DEFAULT_SNI_LIST=("gateway.icloud.com" "itunes.apple.com" "swdist.apple.com" "addons.mozilla.org" "www.samsung.com" "www.lovelive-anime.jp")
+DEFAULT_HOP_PORTS="20000-50000"
+TLS_SNI=""
+DEFAULT_SNI_LIST=(
+    "itunes.apple.com" "www.samsung.com" "download.pda.samsung.com" "www.nvidia.com"
+    "www.speedtest.net" "www.shopify.com" "www.oracle.com" "www.adobe.com" "www.mit.edu"
+    "www.google.com" "www.mozilla.org" "www.bing.com" "www.yahoo.com" "addons.mozilla.org"
+    "www.apple.com" "www.intel.com" "www.amd.com" "www.cisco.com" "www.github.com"
+    "www.paypal.com" "www.ibm.com" "www.dell.com" "www.hp.com" "www.qualcomm.com"
+    "www.wikipedia.org" "www.python.org" "www.rust-lang.org" "www.debian.org" "www.kernel.org"
+    "www.gnu.org" "www.ubuntu.com" "www.redhat.com" "www.fedoraproject.org" "www.archlinux.org"
+    "www.opensuse.org" "www.linuxfoundation.org" "www.nasa.gov" "www.noaa.gov" "www.nist.gov"
+    "www.nih.gov" "www.harvard.edu" "www.stanford.edu" "www.berkeley.edu" "www.cmu.edu"
+    "www.princeton.edu" "www.yale.edu" "www.cam.ac.uk" "www.ox.ac.uk" "www.dropbox.com"
+    "www.salesforce.com"
+)
 
 info() { echo -e "${cyan}[信息]${plain} $1"; }
 success() { echo -e "${green}[成功]${plain} $1"; }
@@ -43,8 +57,9 @@ show_logo() {
     ██║   ██║   ██║██╔══╝  ██║   ██║
     ██║   ╚██████╔╝██║     ╚██████╔╝
     ╚═╝    ╚═════╝ ╚═╝      ╚═════╝ 
-   https://github.com/YGGYDW/ToFu
+
 EOF
+    printf '\033]8;;https://github.com/YGGYDW/ToFu\033\\https://github.com/YGGYDW/ToFu\033]8;;\033\\\n'
     echo -e "${plain}"
 }
 
@@ -94,30 +109,158 @@ check_os() {
 }
 
 install_deps() {
-    info "正在安装必要的系统依赖组件..."
+    info "正在准备必要的系统依赖。"
+    mkdir -p "$CONFIG_DIR"
     if [[ "${PKG_MANAGER}" == "apt-get" ]]; then
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y -q >/dev/null 2>&1
-        apt-get install -y -q curl wget tar unzip jq openssl iptables iproute2 qrencode python3 >/dev/null 2>&1
+        record_new_packages curl wget tar unzip jq openssl iptables iproute2 qrencode python3
+        run_package_task "更新软件包索引" apt-get update || return 1
+        run_package_task "安装系统依赖" apt-get install -y curl wget tar unzip jq openssl iptables iproute2 qrencode python3 || return 1
     elif [[ "${PKG_MANAGER}" == "yum" ]]; then
-        yum install -y epel-release >/dev/null 2>&1
-        yum install -y curl wget tar unzip jq openssl iptables iproute qrencode python3 >/dev/null 2>&1
+        record_new_packages epel-release curl wget tar unzip jq openssl iptables iproute qrencode python3
+        run_package_task "安装 EPEL 仓库" yum install -y epel-release || return 1
+        run_package_task "安装系统依赖" yum install -y curl wget tar unzip jq openssl iptables iproute qrencode python3 || return 1
     elif [[ "${PKG_MANAGER}" == "apk" ]]; then
-        apk update >/dev/null 2>&1
-        apk add --no-cache curl wget tar unzip jq openssl iptables iproute2 bash python3 >/dev/null 2>&1
+        record_new_packages curl wget tar unzip jq openssl iptables iproute2 bash python3
+        run_package_task "更新软件包索引" apk update || return 1
+        run_package_task "安装系统依赖" apk add --no-cache curl wget tar unzip jq openssl iptables iproute2 bash python3 || return 1
     fi
     success "基础依赖组件准备完毕。"
 }
 
+run_package_task() {
+    local label=$1; shift
+    local log_file fifo_file fifo_dir progress_pid status bar offset direction
+    log_file=$(mktemp) || return 1
+    if [[ "$1" == "apt-get" ]]; then
+        shift
+        fifo_dir=$(mktemp -d) || { rm -f "$log_file"; return 1; }
+        fifo_file="${fifo_dir}/status"
+        mkfifo "$fifo_file" || { rm -rf "$fifo_dir"; rm -f "$log_file"; return 1; }
+        awk -F: '
+            /^(dlstatus|pmstatus):/ && $3 ~ /^[0-9]+([.][0-9]+)?$/ {
+                pct=$3+0; filled=int(pct/2+0.5); if (filled>50) filled=50
+                eq=sprintf("%*s",filled,""); gsub(/ /,"=",eq)
+                gap=26-filled; if (gap<0) gap=0
+                pct_text=sprintf("%.1f%%",pct)
+                tail=56-filled-gap-length(pct_text); if (tail<0) tail=0
+                printf "\r%s [%s%*s%s%*s]", label, eq, gap, "", pct_text, tail, ""
+                fflush()
+            }
+        ' label="$label" "$fifo_file" &
+        progress_pid=$!
+        DEBIAN_FRONTEND=noninteractive apt-get -o APT::Status-Fd=3 "$@" 3>"$fifo_file" >"$log_file" 2>&1
+        status=$?
+        wait "$progress_pid" 2>/dev/null || true
+        rm -rf "$fifo_dir"
+    else
+        offset=0; direction=1
+        "$@" >"$log_file" 2>&1 &
+        progress_pid=$!
+        while kill -0 "$progress_pid" 2>/dev/null; do
+            sleep 0.15
+            bar=""
+            for ((i=0; i<50; i++)); do
+                if (( i >= offset && i < offset + 9 )); then bar+="="; else bar+=" "; fi
+            done
+            printf "\r%s [%s处理中]" "$label" "$bar"
+            ((offset+=direction))
+            if (( offset >= 41 )); then direction=-1; elif (( offset <= 0 )); then direction=1; fi
+        done
+        wait "$progress_pid"; status=$?
+    fi
+    if [[ $status -eq 0 ]]; then
+        printf "\r%s [==================================================100.0%%]\n" "$label"
+    else
+        printf "\n[错误] %s失败，简要诊断：\n" "$label"
+        tail -n 12 "$log_file"
+    fi
+    rm -f "$log_file"
+    return "$status"
+}
+
+render_curl_progress() {
+    local label=$1
+    tr '\r' '\n' | awk -v label="$label" '
+        {
+            if (match($0, /[0-9]+([.][0-9]+)?%/)) {
+                pct_text = substr($0, RSTART, RLENGTH)
+                sub(/%$/, "", pct_text)
+                pct = pct_text + 0
+                filled = int(pct / 2 + 0.5)
+                if (filled > 50) filled = 50
+                eq = sprintf("%*s", filled, "")
+                gsub(/ /, "=", eq)
+                pct_text = sprintf("%.1f%%", pct)
+                printf "\r%s [%s%s]", label, eq, pct_text
+                fflush()
+            } else if ($0 ~ /^[#O= .\/-]+$/) {
+                next
+            } else if ($0 ~ /[^[:space:]]/) {
+                print $0 > "/dev/stderr"
+            }
+        }
+        END { printf "\n" }
+    '
+}
+
+curl_with_progress() {
+    local label=$1
+    shift
+    curl --fail --location --show-error --progress-bar --stderr >(render_curl_progress "$label") "$@"
+}
+
+record_new_packages() {
+    local package
+    local manifest="${CONFIG_DIR}/packages-installed.txt"
+    touch "$manifest"
+    for package in "$@"; do
+        local installed=false
+        case "$PKG_MANAGER" in
+            apt-get) dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null | grep -qx installed && installed=true ;;
+            yum) rpm -q "$package" >/dev/null 2>&1 && installed=true ;;
+            apk) apk info -e "$package" >/dev/null 2>&1 && installed=true ;;
+        esac
+        if [[ "$installed" == false ]] && ! grep -Fxq "$package" "$manifest"; then
+            printf '%s\n' "$package" >> "$manifest"
+        fi
+    done
+    chmod 600 "$manifest"
+}
+
+remove_recorded_packages() {
+    local manifest="${CONFIG_DIR}/packages-installed.txt"
+    [[ -s "$manifest" ]] || return 0
+    local -a packages=()
+    mapfile -t packages < "$manifest"
+    ((${#packages[@]})) || return 0
+    info "卸载清单中的依赖包..."
+    case "$PKG_MANAGER" in
+        apt-get) run_package_task "卸载依赖包" apt-get remove -y "${packages[@]}" || warn "部分依赖包未能移除。" ;;
+        yum) run_package_task "卸载依赖包" yum remove -y "${packages[@]}" || warn "部分依赖包未能移除。" ;;
+        apk) run_package_task "卸载依赖包" apk del "${packages[@]}" || warn "部分依赖包未能移除。" ;;
+    esac
+}
+
 enable_bbr() {
     info "正在检测并优化系统 TCP BBR 加速..."
-    touch /etc/sysctl.conf
+    mkdir -p "$CONFIG_DIR"
+    if [[ ! -f "$SYSTEM_STATE_FILE" ]]; then
+        printf 'tcp_congestion_control\t%s\ndefault_qdisc\t%s\n' \
+            "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)" \
+            "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)" > "$SYSTEM_STATE_FILE"
+    fi
     if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
-        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-        sysctl -p >/dev/null 2>&1
+        if [[ -e /etc/sysctl.d/99-tofu-bbr.conf ]]; then
+            warn "发现已有 /etc/sysctl.d/99-tofu-bbr.conf，未覆盖该文件；请手动检查 BBR 设置。"
+        else
+            cat > /etc/sysctl.d/99-tofu-bbr.conf <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+            touch "${CONFIG_DIR}/tofu_bbr_managed"
+            sysctl --system >/dev/null 2>&1
+        fi
     fi
     success "Linux TCP BBR 内核加速已启用！"
 }
@@ -127,10 +270,8 @@ get_public_ip() {
     IP=$(curl -s4m5 "https://api.ipify.org" || curl -s4m5 "https://icanhazip.com" || curl -s4m5 "https://ip.sb")
     if [[ -z "${IP}" ]]; then
         IP=$(curl -s6m5 "https://api64.ipify.org" || curl -s6m5 "https://icanhazip.com")
-        IS_IPV6_ONLY=true
         warn "未检测到有效 IPv4 地址，将以 IPv6 地址模式继续: ${IP}"
     else
-        IS_IPV6_ONLY=false
         success "检测到公网 IPv4: ${IP}"
     fi
 }
@@ -172,69 +313,46 @@ scan_port_status() {
 
 scan_and_display_ports() {
     echo -e "${cyan}[端口]${plain} 检查以下端口开放状态:"
-    
     local http_ports=(80 8080 8880 2052 2082 2086 2095)
-    local http_str=""
-    for p in "${http_ports[@]}"; do
-        local status
-        status=$(scan_port_status "$p" "tcp")
-        if [[ "$status" == "可用" ]]; then
-            http_str+="${green}[✔ ${p}]${plain} "
-        else
-            http_str+="${red}[✖ ${p} ${status}]${plain} "
-        fi
-    done
-    echo -e "  * 80系端口 (HTTP)  : ${http_str}"
-
     local https_ports=(443 2053 2083 2087 2096 8443)
-    local https_str=""
-    for p in "${https_ports[@]}"; do
-        local status
+    local p status
+    echo -e "  * 80系端口 (HTTP)  :"
+    for p in "${http_ports[@]}"; do
+        printf "\t[检测 %s ...]" "$p"
+        sleep 0.12
         status=$(scan_port_status "$p" "tcp")
         if [[ "$status" == "可用" ]]; then
-            https_str+="${green}[✔ ${p}]${plain} "
+            printf "\r\033[K\t${green}[✔ %s]${plain}\n" "$p"
         else
-            https_str+="${red}[✖ ${p} ${status}]${plain} "
+            printf "\r\033[K\t${red}[✖ %s %s]${plain}\n" "$p" "$status"
         fi
     done
-    echo -e "  * 443系端口 (HTTPS): ${https_str}"
+
+    echo -e "  * 443系端口 (HTTPS):"
+    for p in "${https_ports[@]}"; do
+        printf "\t[检测 %s ...]" "$p"
+        sleep 0.12
+        status=$(scan_port_status "$p" "tcp")
+        if [[ "$status" == "可用" ]]; then
+            printf "\r\033[K\t${green}[✔ %s]${plain}\n" "$p"
+        else
+            printf "\r\033[K\t${red}[✖ %s %s]${plain}\n" "$p" "$status"
+        fi
+    done
 
     local udp_conflict_count=0
     if command -v ss >/dev/null 2>&1; then
-        udp_conflict_count=$(ss -uln | awk '{print $5}' | awk -F: '{print $NF}' | awk '$1>=20000 && $1<=40000' | wc -l)
+        udp_conflict_count=$(ss -uln | awk '{print $5}' | awk -F: '{print $NF}' | awk '$1>=20000 && $1<=50000' | wc -l)
     fi
     if [[ "$udp_conflict_count" -eq 0 ]]; then
-        echo -e "  * 端口跳跃段 (UDP) : ${green}[✔ 20000 ~ 40000 全部空闲可用 (共 20001 个端口)]${plain}"
+        echo -e "  * 端口跳跃段 (UDP) : \n\t${green}[✔ 20000 ~ 50000] 未发现监听冲突 (共 30001 个端口)${plain}"
     else
-        echo -e "  * 端口跳跃段 (UDP) : ${yellow}[⚠ 20000 ~ 40000 检测到 ${udp_conflict_count} 个端口占用]${plain}"
+        echo -e "  * 端口跳跃段 (UDP) : \n\t${yellow}[⚠ 20000 ~ 50000] 检测到 ${udp_conflict_count} 个监听项${plain}"
     fi
 }
 
 configure_firewalls() {
-    local p1=${1:-${PORT_REALITY:-443}}
-    local p2=${2:-${PORT_HY2:-8443}}
-    local p3=${3:-${PORT_XHTTP:-2053}}
-    local hs=${4:-${PORT_HOP_START:-20000}}
-    local he=${5:-${PORT_HOP_END:-40000}}
-
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qw "active"; then
-        info "检测到系统已启用 UFW 防火墙，正在自动放行端口..."
-        ufw allow ${p1}/tcp >/dev/null 2>&1
-        ufw allow ${p2}/udp >/dev/null 2>&1
-        ufw allow ${p3}/tcp >/dev/null 2>&1
-        ufw allow ${hs}:${he}/udp >/dev/null 2>&1
-        success "UFW 端口规则已放行完毕。"
-    fi
-
-    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        info "检测到系统已启用 Firewalld，正在自动放行端口..."
-        firewall-cmd --zone=public --add-port=${p1}/tcp --permanent >/dev/null 2>&1
-        firewall-cmd --zone=public --add-port=${p2}/udp --permanent >/dev/null 2>&1
-        firewall-cmd --zone=public --add-port=${p3}/tcp --permanent >/dev/null 2>&1
-        firewall-cmd --zone=public --add-port=${hs}-${he}/udp --permanent >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-        success "Firewalld 端口规则已放行完毕。"
-    fi
+    echo -e "${cyan}[信息]提示：请确保以上端口在 VPS 防火墙中开放服务。${plain}"
 }
 
 check_port_occupied() {
@@ -256,6 +374,51 @@ check_port_occupied() {
         return $?
     fi
     return 1
+}
+
+validate_hop_ports() {
+    local list=$1 token start end
+    local -a parts
+    [[ -n "$list" && "$list" != ,* && "$list" != *, && "$list" != *,,* ]] || return 1
+    IFS=',' read -ra parts <<< "$list"
+    for token in "${parts[@]}"; do
+        if [[ "$token" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+            start=$((10#${BASH_REMATCH[1]})); end=$((10#${BASH_REMATCH[2]}))
+        elif [[ "$token" =~ ^[0-9]{1,5}$ ]]; then
+            start=$((10#$token)); end=$start
+        else
+            return 1
+        fi
+        (( start >= 1025 && end >= start && end <= 65535 )) || return 1
+    done
+    return 0
+}
+
+check_hop_ports_available() {
+    local list=$1 addr port token start end conflicts=0 shown=""
+    local -a parts
+    IFS=',' read -ra parts <<< "$list"
+    if ! command -v ss >/dev/null 2>&1; then
+        warn "系统没有 ss，无法检查 UDP 跳跃端口占用情况。"
+        return 0
+    fi
+    while IFS= read -r addr; do
+        port=${addr##*:}
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        for token in "${parts[@]}"; do
+            if [[ "$token" == *-* ]]; then start=$((10#${token%-*})); end=$((10#${token#*-})); else start=$((10#$token)); end=$start; fi
+            if (( port >= start && port <= end )); then
+                ((conflicts++))
+                if (( conflicts <= 12 )); then shown+=" ${port}"; fi
+                break
+            fi
+        done
+    done < <(ss -H -lun | awk '{print $5}')
+    if (( conflicts > 0 )); then
+        warn "所选 UDP 跳跃端口中发现 ${conflicts} 个已监听端口（示例：${shown}）；请更换端口后重试。"
+        return 1
+    fi
+    success "所选 UDP 跳跃端口未发现本机监听冲突。"
 }
 
 find_free_port() {
@@ -280,52 +443,84 @@ install_xray_core() {
     info "正在从 GitHub 获取 Xray-core 官方最新正式版..."
     [[ -z "${ARCH}" ]] && check_arch
 
-    local latest_tag
-    latest_tag=$(curl -sSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r .tag_name 2>/dev/null)
-    if [[ -z "${latest_tag}" || "${latest_tag}" == "null" ]]; then
-        latest_tag="v25.1.30"
-        warn "获取 GitHub 最新版本号失败，使用回退版本号: ${latest_tag}"
+    local latest_tag release_api
+    release_api=$(mktemp) || return 1
+    if ! curl -fLsS --connect-timeout 10 --max-time 60 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" -o "$release_api"; then
+        error "无法读取 Xray 官方 Release API；已停止安装，未使用未验证的旧版本或第三方镜像。"
+        rm -f "$release_api"
+        return 1
+    fi
+    latest_tag=$(jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$release_api" 2>/dev/null) || latest_tag=""
+    rm -f "$release_api"
+    if [[ -z "$latest_tag" ]]; then
+        error "官方版本号缺失或格式异常，已停止安装。"
+        return 1
     fi
 
     local download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_tag}/Xray-linux-${ARCH}.zip"
     info "下载地址: ${download_url}"
 
     local tmp_dir
-    tmp_dir=$(mktemp -d)
-    local dl_ok=false
-    echo -e "${cyan}[下载]${plain} 正在拉取 Xray-core 官方核心软件包..."
-    if curl -L --progress-bar "${download_url}" -o "${tmp_dir}/xray.zip"; then
-        dl_ok=true
-        echo -e "${green}.........................................✅${plain}"
-    else
-        local mirror_url="https://ghproxy.net/${download_url}"
-        warn "官方直连较慢，正在切换镜像源拉取..."
-        if curl -L --progress-bar "${mirror_url}" -o "${tmp_dir}/xray.zip"; then
-            dl_ok=true
-            echo -e "${green}.........................................✅${plain}"
-        fi
+    tmp_dir=$(mktemp -d) || return 1
+    echo -e "${cyan}[下载 1/2]${plain} 正在从 Xray 官方发布地址下载核心（显示 curl 实际传输进度）..."
+    if ! curl_with_progress "下载 Xray 核心" --connect-timeout 10 --retry 2 --retry-delay 2 "${download_url}" -o "${tmp_dir}/xray.zip"; then
+        error "官方核心包下载失败；已停止安装。"
+        rm -rf "$tmp_dir"
+        return 1
     fi
+    echo -e "${cyan}[下载 2/2]${plain} 正在下载官方 SHA-256 校验文件..."
+    if ! curl -fLsS --connect-timeout 10 --retry 2 --retry-delay 2 "${download_url}.dgst" -o "${tmp_dir}/xray.zip.dgst"; then
+        error "官方校验文件下载失败；已停止安装。"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    local expected_sha actual_sha
+    expected_sha=$(awk -F '= ' '/256=/ {print $2; exit}' "${tmp_dir}/xray.zip.dgst" | tr -d '\r ')
+    if [[ ! "$expected_sha" =~ ^[[:xdigit:]]{64}$ ]]; then
+        error "官方 SHA-256 文件格式无效；已停止安装。"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    actual_sha=$(sha256sum "${tmp_dir}/xray.zip" | awk '{print $1}')
+    if [[ "${actual_sha,,}" != "${expected_sha,,}" ]]; then
+        error "Xray 核心包 SHA-256 校验失败；未替换现有核心。"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    success "官方 SHA-256 校验通过。"
 
-    unzip -q -o "${tmp_dir}/xray.zip" -d "${tmp_dir}"
-    if [[ ! -f "${tmp_dir}/xray" ]]; then
+    if ! unzip -q -o "${tmp_dir}/xray.zip" -d "${tmp_dir}" || [[ ! -s "${tmp_dir}/xray" ]]; then
         error "解压 Xray 二进制失败！"
         rm -rf "${tmp_dir}"
-        exit 1
+        return 1
+    fi
+    if ! "${tmp_dir}/xray" version >/dev/null 2>&1; then
+        error "下载的 Xray 二进制无法在本机运行（架构或文件格式不符）；未替换现有核心。"
+        rm -rf "$tmp_dir"
+        return 1
     fi
 
     mkdir -p "${CONFIG_DIR}"
     mkdir -p "${CONFIG_DIR}/certs"
-    cp -f "${tmp_dir}/xray" "${XRAY_BIN}"
-    chmod +x "${XRAY_BIN}"
+    chmod 700 "${CONFIG_DIR}" "${CONFIG_DIR}/certs"
+    if [[ -e "${XRAY_BIN}" && ! -f "${CONFIG_DIR}/xray_managed" && ! -f "${CONFIG_DIR}/xray.original" ]]; then
+        cp -p "${XRAY_BIN}" "${CONFIG_DIR}/xray.original" || { error "无法备份已有的 ${XRAY_BIN}，为避免覆盖现有服务而中止。"; rm -rf "$tmp_dir"; exit 1; }
+    fi
+    install -m 0755 "${tmp_dir}/xray" "${XRAY_BIN}.new" || { rm -rf "$tmp_dir"; return 1; }
+    mv -f "${XRAY_BIN}.new" "${XRAY_BIN}" || { rm -f "${XRAY_BIN}.new"; rm -rf "$tmp_dir"; return 1; }
+    touch "${CONFIG_DIR}/xray_managed"
 
-    mkdir -p /usr/local/share/xray
+    if [[ ! -d /usr/local/share/xray ]]; then
+        mkdir -p /usr/local/share/xray
+        touch "${CONFIG_DIR}/xray_share_dir_managed"
+    fi
     if [[ -f "${tmp_dir}/geoip.dat" ]]; then
-        cp -f "${tmp_dir}/geoip.dat" /usr/local/share/xray/
-        cp -f "${tmp_dir}/geoip.dat" /usr/local/bin/
+        install_managed_asset "${tmp_dir}/geoip.dat" /usr/local/share/xray/geoip.dat geoip_share
+        install_managed_asset "${tmp_dir}/geoip.dat" /usr/local/bin/geoip.dat geoip_bin
     fi
     if [[ -f "${tmp_dir}/geosite.dat" ]]; then
-        cp -f "${tmp_dir}/geosite.dat" /usr/local/share/xray/
-        cp -f "${tmp_dir}/geosite.dat" /usr/local/bin/
+        install_managed_asset "${tmp_dir}/geosite.dat" /usr/local/share/xray/geosite.dat geosite_share
+        install_managed_asset "${tmp_dir}/geosite.dat" /usr/local/bin/geosite.dat geosite_bin
     fi
 
     rm -rf "${tmp_dir}"
@@ -335,34 +530,153 @@ install_xray_core() {
     success "Xray 官方内核已成功就绪: Version ${installed_version}"
 }
 
-probe_best_sni() {
-    info "正在探测最优 REALITY 伪装域名（TLS 1.3 + H2 支持度）..."
-    local best_sni=""
-    local min_latency=999999
+install_managed_asset() {
+    local source=$1 destination=$2 name=$3 backup_dir="${CONFIG_DIR}/originals"
+    mkdir -p "$(dirname "$destination")" "$backup_dir"
+    if [[ -e "$destination" && ! -f "${CONFIG_DIR}/${name}.managed" && ! -e "${backup_dir}/${name}" ]]; then
+        cp -p "$destination" "${backup_dir}/${name}" || { error "无法备份现有文件：${destination}"; return 1; }
+    fi
+    cp -f "$source" "$destination" || return 1
+    touch "${CONFIG_DIR}/${name}.managed"
+}
 
-    for sni in "${DEFAULT_SNI_LIST[@]}"; do
-        local latency
-        latency=$(curl -s -w "%{time_connect}\n" -o /dev/null --connect-timeout 2 "https://${sni}" 2>/dev/null | awk '{print int($1 * 1000)}')
-        if [[ -n "$latency" && "$latency" -gt 0 ]]; then
-            if [[ "$latency" -lt "$min_latency" ]]; then
-                min_latency=$latency
-                best_sni=$sni
+restore_managed_asset() {
+    local destination=$1 name=$2 backup
+    backup="${CONFIG_DIR}/originals/${name}"
+    if [[ -e "$backup" ]]; then
+        cp -p "$backup" "$destination"
+    elif [[ -f "${CONFIG_DIR}/${name}.managed" ]]; then
+        rm -f "$destination"
+    fi
+}
+
+probe_best_sni() {
+    info "正在从 VPS 检查 REALITY SNI 候选（TLS 1.3、证书、H2、HTTP 跳转）..."
+    local sni probe_data code redirect connect appconnect http_version verify_result ms_latency sorted choice idx reason cert_pem san_match http_ok redirect_ok i j tmp tested found
+    local -a tested_sni=() remaining_sni=() shuffled_sni=() candidates=() latencies=()
+    local probe_count=10
+
+    while true; do
+        remaining_sni=()
+        for sni in "${DEFAULT_SNI_LIST[@]}"; do
+            found=0
+            for tested in "${tested_sni[@]}"; do
+                [[ "$tested" == "$sni" ]] && found=1 && break
+            done
+            (( found == 0 )) && remaining_sni+=("$sni")
+        done
+        if (( ${#remaining_sni[@]} == 0 )); then
+            warn "候选域名已全部检测完毕，仍没有可用候选。"
+            candidates=(); latencies=()
+        else
+            shuffled_sni=("${remaining_sni[@]}")
+            # Fisher-Yates shuffle; each recheck draws from domains not checked in prior batches.
+            for ((i=${#shuffled_sni[@]}-1; i>0; i--)); do
+                j=$((RANDOM % (i+1)))
+                tmp=${shuffled_sni[$i]}
+                shuffled_sni[$i]=${shuffled_sni[$j]}
+                shuffled_sni[$j]=$tmp
+            done
+            candidates=(); latencies=()
+            echo -e "${cyan}========================================================================${plain}"
+            printf '%-30s %-8s %-8s %-8s %-12s %s\n' "候选域名（本轮随机抽取）" "TLS1.3" "证书" "H2" "HTTP" "结果"
+            for sni in "${shuffled_sni[@]:0:probe_count}"; do
+                tested_sni+=("$sni")
+                printf '%-30s ' "$sni"
+                # --http2 requests H2; TLS is constrained to 1.3. Do not follow redirects.
+                if ! probe_data=$(curl -sS --connect-timeout 3 --max-time 8 --tlsv1.3 --tls-max 1.3 --http2 \
+                    -o /dev/null -w '%{http_code}|%{redirect_url}|%{time_connect}|%{time_appconnect}|%{http_version}|%{ssl_verify_result}' \
+                    "https://${sni}" 2>/dev/null); then
+                    printf '%-8s %-8s %-8s %-12s %s\n' "失败" "失败" "失败" "-" "TLS/证书/HTTP 探测失败"
+                    continue
+                fi
+                IFS='|' read -r code redirect connect appconnect http_version verify_result <<< "$probe_data"
+                reason=""
+                [[ "$verify_result" == "0" ]] || reason="证书链校验失败"
+                if [[ "$http_version" != "2" ]]; then reason="${reason:+${reason}、}未协商 H2"; fi
+                if [[ "$code" =~ ^3[0-9][0-9]$ ]]; then reason="${reason:+${reason}、}HTTP ${code} 跳转至 ${redirect:-未知地址}"; fi
+                http_ok=0; [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && http_ok=1
+                redirect_ok=1; [[ "$code" =~ ^3[0-9][0-9]$ ]] && redirect_ok=0
+                cert_pem=$(timeout 8 openssl s_client -connect "${sni}:443" -servername "$sni" -tls1_3 -showcerts </dev/null 2>/dev/null \
+                    | awk 'BEGIN{n=0} /-----BEGIN CERTIFICATE-----/{n++} n==1{print} /-----END CERTIFICATE-----/&&n==1{exit}')
+                san_match=0
+                if [[ -n "$cert_pem" ]] && printf '%s\n' "$cert_pem" | openssl x509 -noout -checkhost "$sni" >/dev/null 2>&1; then
+                    san_match=1
+                else
+                    reason="${reason:+${reason}、}证书 SAN 不匹配"
+                fi
+                ms_latency=$(awk -v t="$connect" 'BEGIN {if (t ~ /^[0-9]+(\.[0-9]+)?$/) printf "%d", t*1000; else print 999999}')
+                if [[ "$verify_result" == "0" && "$http_version" == "2" && "$http_ok" == 1 && "$redirect_ok" == 1 && "$san_match" == 1 ]]; then
+                    printf '%-8s %-8s %-8s %-12s %s ms TCP / %s ms TLS\n' "通过" "匹配" "通过" "HTTP ${code:-?}" "$ms_latency" "$(awk -v t="$appconnect" 'BEGIN {printf "%d", t*1000}')"
+                    candidates+=("$sni"); latencies+=("$ms_latency")
+                else
+                    printf '%-8s %-8s %-8s %-12s %s\n' "$([[ "$verify_result" == 0 ]] && echo 通过 || echo 失败)" "$([[ "$san_match" == 1 ]] && printf '匹配' || printf '不匹配')" "$([[ "$http_version" == 2 ]] && echo 通过 || echo 失败)" "HTTP ${code:-?}" "${reason:-未满足筛选条件}"
+                fi
+            done
+        fi
+        echo -e "${cyan}========================================================================${plain}"
+
+        if (( ${#candidates[@]} > 0 )); then
+            sorted=$(for idx in "${!candidates[@]}"; do printf '%s\t%s\n' "${latencies[$idx]}" "${candidates[$idx]}"; done | sort -n)
+            mapfile -t candidates < <(printf '%s\n' "$sorted" | awk -F '\t' '{print $2}')
+            mapfile -t latencies < <(printf '%s\n' "$sorted" | awk -F '\t' '{print $1}')
+            echo "合格候选（按 TCP 建连时间排序；TLS 时间仅供参考）："
+            for idx in "${!candidates[@]}"; do printf '  %d. %-32s %s ms\n' "$((idx+1))" "${candidates[$idx]}" "${latencies[$idx]}"; done
+            echo -e "${cyan}========================================================================${plain}"
+            read -rp "选择编号，r 再随机检测其他域名，m 手动填写 [默认: 1]: " choice
+            choice=${choice:-1}
+            if [[ "$choice" == r || "$choice" == R ]]; then continue; fi
+            if [[ "$choice" == m || "$choice" == M ]]; then
+                read -rp "请输入 REALITY SNI 域名: " sni
+                if [[ "$sni" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then REALITY_SNI=${sni,,}; break; fi
+                warn "域名格式无效，请重新运行 SNI 探测。"; return 1
             fi
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#candidates[@]} )); then
+                REALITY_SNI=${candidates[$((choice-1))]}; break
+            fi
+            warn "输入无效，请重新选择。"
+        else
+            warn "本轮没有候选通过全部检查。"
+            read -rp "输入 r 随机检测尚未检查的域名，m 手动填写 SNI，q 取消安装: " choice
+            case "$choice" in
+                r|R) (( ${#remaining_sni[@]} > 0 )) || warn "候选池已全部检测过，不能继续抽取。" ;;
+                m|M)
+                    read -rp "请输入 REALITY SNI 域名: " sni
+                    if [[ "$sni" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then REALITY_SNI=${sni,,}; break; fi
+                    warn "域名格式无效，请重新运行 SNI 探测。"; return 1
+                    ;;
+                q|Q) return 1 ;;
+                *) warn "请输入 r、m 或 q。" ;;
+            esac
         fi
     done
-
-    if [[ -z "$best_sni" ]]; then
-        best_sni="gateway.icloud.com"
-        info "采用备用可靠 SNI 域名: ${best_sni}"
-    else
-        success "选出延迟最低的最优 SNI: ${best_sni} (握手延迟: ${min_latency}ms)"
-    fi
-    REALITY_SNI="${best_sni}"
+    success "已选择 REALITY SNI：${REALITY_SNI}"
 }
 
 generate_credentials() {
-    info "正在生成高强度加密凭证与密钥对..."
-    UUID=$("${XRAY_BIN}" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+    info "正在配置节点 UUID..."
+    while true; do
+        echo "  1. 自动生成 UUID（推荐）"
+        echo "  2. 手动填写 UUID"
+        read -rp "请选择 [默认: 1]: " uuid_mode
+        uuid_mode=${uuid_mode:-1}
+        case "$uuid_mode" in
+            1)
+                UUID=$("${XRAY_BIN}" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+                break
+                ;;
+            2)
+                read -rp "请输入 UUID（格式 XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX）: " user_uuid
+                if [[ "$user_uuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+                    UUID=${user_uuid,,}
+                    break
+                fi
+                warn "UUID 格式无效，请按标准 UUID 格式重新输入。"
+                ;;
+            *) warn "选择无效，请输入 1 或 2。" ;;
+        esac
+    done
+    info "正在生成 REALITY 密钥与 TLS 证书..."
     
     local key_pair
     key_pair=$("${XRAY_BIN}" x25519)
@@ -374,43 +688,43 @@ generate_credentials() {
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
         -keyout "${CONFIG_DIR}/certs/ecc.key" \
         -out "${CONFIG_DIR}/certs/ecc.crt" \
-        -subj "/CN=www.bing.com" -days 3650 \
-        -addext "subjectAltName=DNS:www.bing.com" >/dev/null 2>&1
+        -subj "/CN=${TLS_SNI}" -days 3650 \
+        -addext "subjectAltName=DNS:${TLS_SNI}" >/dev/null 2>&1
+    chmod 600 "${CONFIG_DIR}/certs/ecc.key" "${CONFIG_DIR}/certs/ecc.crt"
 
     CERT_SHA256=$(openssl x509 -noout -fingerprint -sha256 -in "${CONFIG_DIR}/certs/ecc.crt" | cut -d'=' -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]')
     success "凭证与证书生成完毕。"
 }
 
 setup_iptables_port_hopping() {
-    info "正在配置 Hysteria 2 端口跳跃转发规则 (${PORT_HOP_START}:${PORT_HOP_END} -> ${PORT_HY2})..."
+    info "正在配置 Hysteria 2 端口跳跃转发规则 (${PORT_HOP_PORTS} -> ${PORT_HY2})..."
     cat > "${IPTABLES_SCRIPT}" <<'EOF'
 #!/usr/bin/env bash
 ACTION=$1
 TARGET_PORT=$2
-START_PORT=${3:-20000}
-END_PORT=${4:-40000}
+PORT_LIST=${3:-20000-50000}
 
 [[ -z "${TARGET_PORT}" ]] && exit 1
 
-enable_rules() {
-    disable_rules
-    iptables -t nat -A PREROUTING -p udp --dport ${START_PORT}:${END_PORT} -j REDIRECT --to-ports ${TARGET_PORT} 2>/dev/null
-    ip6tables -t nat -A PREROUTING -p udp --dport ${START_PORT}:${END_PORT} -j REDIRECT --to-ports ${TARGET_PORT} 2>/dev/null || true
-}
-
-disable_rules() {
-    iptables -t nat -D PREROUTING -p udp --dport ${START_PORT}:${END_PORT} -j REDIRECT --to-ports ${TARGET_PORT} 2>/dev/null || true
-    ip6tables -t nat -D PREROUTING -p udp --dport ${START_PORT}:${END_PORT} -j REDIRECT --to-ports ${TARGET_PORT} 2>/dev/null || true
-}
-
-case "${ACTION}" in
-    enable) enable_rules ;;
-    disable) disable_rules ;;
-    *) echo "Usage: $0 {enable|disable} <target_port> [start_port] [end_port]" ;;
-esac
+IFS=',' read -ra PORTS <<< "$PORT_LIST"
+for PORT_SPEC in "${PORTS[@]}"; do
+    PORT_SPEC=${PORT_SPEC/-/:}
+    if [[ "$ACTION" == enable ]]; then
+        iptables -t nat -C PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" 2>/dev/null || \
+            iptables -t nat -A PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" || exit 1
+        ip6tables -t nat -C PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" 2>/dev/null || \
+            ip6tables -t nat -A PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" 2>/dev/null || true
+    elif [[ "$ACTION" == disable ]]; then
+        while iptables -t nat -D PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" 2>/dev/null; do :; done
+        while ip6tables -t nat -D PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" 2>/dev/null; do :; done
+    else
+        echo "Usage: $0 {enable|disable} <target_port> [port-list]"
+        exit 2
+    fi
+done
 EOF
     chmod +x "${IPTABLES_SCRIPT}"
-    /bin/bash "${IPTABLES_SCRIPT}" enable "${PORT_HY2}" "${PORT_HOP_START}" "${PORT_HOP_END}"
+    /bin/bash "${IPTABLES_SCRIPT}" enable "${PORT_HY2}" "${PORT_HOP_PORTS}"
     success "Hysteria 2 端口跳跃内核级 NAT 转发已就绪！"
 }
 
@@ -563,13 +877,14 @@ generate_server_config() {
 }
 EOF
 
+    chmod 600 "${CONFIG_FILE}"
     info "执行 Xray 配置文件严格语法检查..."
     if ! "${XRAY_BIN}" -test -config "${CONFIG_FILE}" >/dev/null 2>&1; then
         error "配置文件检查未通过！详细日志如下："
         "${XRAY_BIN}" -test -config "${CONFIG_FILE}"
         exit 1
     fi
-    success "配置文件静态检查通过 (100% 官方合规)。"
+    success "Xray 配置文件检查通过。"
 }
 
 setup_system_service() {
@@ -587,9 +902,9 @@ User=root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-ExecStartPre=-/bin/bash ${IPTABLES_SCRIPT} enable ${PORT_HY2} ${PORT_HOP_START} ${PORT_HOP_END}
+ExecStartPre=-/bin/bash ${IPTABLES_SCRIPT} enable ${PORT_HY2} ${PORT_HOP_PORTS}
 ExecStart=${XRAY_BIN} run -config ${CONFIG_FILE}
-ExecStopPost=-/bin/bash ${IPTABLES_SCRIPT} disable ${PORT_HY2} ${PORT_HOP_START} ${PORT_HOP_END}
+ExecStopPost=-/bin/bash ${IPTABLES_SCRIPT} disable ${PORT_HY2} ${PORT_HOP_PORTS}
 Restart=always
 RestartSec=3s
 LimitNOFILE=65535
@@ -610,21 +925,57 @@ pidfile="/run/tofu.pid"
 command_background="yes"
 
 start_pre() {
-    /bin/bash ${IPTABLES_SCRIPT} enable ${PORT_HY2} ${PORT_HOP_START} ${PORT_HOP_END}
+    /bin/bash ${IPTABLES_SCRIPT} enable ${PORT_HY2} ${PORT_HOP_PORTS}
 }
 
 stop_post() {
-    /bin/bash ${IPTABLES_SCRIPT} disable ${PORT_HY2} ${PORT_HOP_START} ${PORT_HOP_END}
+    /bin/bash ${IPTABLES_SCRIPT} disable ${PORT_HY2} ${PORT_HOP_PORTS}
 }
 EOF
         chmod +x "${OPENRC_FILE}"
         rc-update add tofu default >/dev/null 2>&1
         rc-service tofu restart
     else
-        killall -9 xray >/dev/null 2>&1 || true
-        nohup "${XRAY_BIN}" run -config "${CONFIG_FILE}" >/dev/null 2>&1 &
+        start_fallback_service
     fi
     success "ToFu 后台守护进程启动成功！"
+}
+
+start_fallback_service() {
+    if [[ -f "$FALLBACK_PID_FILE" ]]; then
+        local old_pid
+        old_pid=$(cat "$FALLBACK_PID_FILE" 2>/dev/null)
+        if is_tofu_fallback_pid "$old_pid"; then
+            kill -0 "$old_pid" 2>/dev/null && { info "ToFu 已在运行（PID ${old_pid}）。"; return 0; }
+        fi
+        rm -f "$FALLBACK_PID_FILE"
+    fi
+    nohup "${XRAY_BIN}" run -config "${CONFIG_FILE}" >/dev/null 2>&1 &
+    echo $! > "$FALLBACK_PID_FILE"
+    sleep 1
+    kill -0 "$(cat "$FALLBACK_PID_FILE")" 2>/dev/null || { rm -f "$FALLBACK_PID_FILE"; error "ToFu 启动失败。"; return 1; }
+}
+
+is_tofu_fallback_pid() {
+    local pid=$1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [[ "$(readlink -f "/proc/${pid}/exe" 2>/dev/null)" == "$(readlink -f "$XRAY_BIN")" ]] || return 1
+    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Fq -- "$CONFIG_FILE"
+}
+
+stop_fallback_service() {
+    [[ -f "$FALLBACK_PID_FILE" ]] || return 0
+    local pid
+    pid=$(cat "$FALLBACK_PID_FILE" 2>/dev/null)
+    if is_tofu_fallback_pid "$pid"; then
+        kill -TERM "$pid" 2>/dev/null || true
+        for _ in {1..10}; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$FALLBACK_PID_FILE"
 }
 
 save_env_data() {
@@ -634,21 +985,45 @@ UUID="${UUID}"
 PORT_REALITY=${PORT_REALITY}
 PORT_HY2=${PORT_HY2}
 PORT_XHTTP=${PORT_XHTTP}
-PORT_HOP_START=${PORT_HOP_START}
-PORT_HOP_END=${PORT_HOP_END}
+PORT_HOP_PORTS="${PORT_HOP_PORTS}"
 REALITY_SNI="${REALITY_SNI}"
+TLS_SNI="${TLS_SNI}"
 REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY}"
 REALITY_SHORT_ID="${REALITY_SHORT_ID}"
 CERT_SHA256="${CERT_SHA256}"
 EOF
+    chmod 600 "$DATA_FILE"
 }
 
 load_env_data() {
-    if [[ -f "${DATA_FILE}" ]]; then
-        source "${DATA_FILE}"
-    elif [[ -f "/etc/xray-box/node_info.env" ]]; then
-        source "/etc/xray-box/node_info.env"
-    fi
+    local env_file="$DATA_FILE" line key value
+    PORT_REALITY=${PORT_REALITY:-$DEFAULT_REALITY_PORT}
+    PORT_HY2=${PORT_HY2:-$DEFAULT_HY2_PORT}
+    PORT_XHTTP=${PORT_XHTTP:-$DEFAULT_XHTTP_PORT}
+    PORT_HOP_PORTS=${PORT_HOP_PORTS:-$DEFAULT_HOP_PORTS}
+    [[ -f "$env_file" ]] || return 0
+    chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+    chmod 600 "$env_file" "$CONFIG_FILE" "${CONFIG_DIR}/certs/ecc.key" "$NODES_TXT" 2>/dev/null || true
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *=* ]] || continue
+        key=${line%%=*}
+        value=${line#*=}
+        value=${value#\"}
+        value=${value%\"}
+        case "$key" in
+            IP) [[ "$value" =~ ^[A-Fa-f0-9:.]+$ ]] && IP=$value ;;
+            UUID) [[ "$value" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] && UUID=${value,,} ;;
+            PORT_REALITY|PORT_HY2|PORT_XHTTP)
+                if [[ "$value" =~ ^[0-9]{1,5}$ ]] && (( value >= 1 && value <= 65535 )); then printf -v "$key" '%s' "$value"; fi
+                ;;
+            PORT_HOP_PORTS) [[ "$value" =~ ^[0-9,-]+$ ]] && PORT_HOP_PORTS=$value ;;
+            REALITY_SNI) [[ "$value" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] && REALITY_SNI=${value,,} ;;
+            TLS_SNI) [[ "$value" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] && TLS_SNI=${value,,} ;;
+            REALITY_PUBLIC_KEY) [[ "$value" =~ ^[A-Za-z0-9_+/=-]+$ ]] && REALITY_PUBLIC_KEY=$value ;;
+            REALITY_SHORT_ID) [[ "$value" =~ ^[[:xdigit:]]{8,16}$ ]] && REALITY_SHORT_ID=$value ;;
+            CERT_SHA256) [[ "$value" =~ ^[[:xdigit:]]{64}$ ]] && CERT_SHA256=${value,,} ;;
+        esac
+    done < "$env_file"
 }
 
 generate_client_links() {
@@ -657,24 +1032,29 @@ generate_client_links() {
         host_ip="[${IP}]"
     fi
 
-    LINK_REALITY="vless://${UUID}@${host_ip}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#%E3%80%90%E4%B8%BB%E5%8A%9B%E6%97%97%E8%88%B0%E3%80%91VLESS%20%2B%20REALITY%20%2B%20XTLS-Vision%20(%E6%97%A5%E5%B8%B8%E4%B8%BB%E5%8A%9B)"
-    LINK_HY2="hysteria2://${UUID}@${host_ip}:${PORT_HY2}?ports=${PORT_HOP_START}-${PORT_HOP_END}&security=tls&alpn=h3&insecure=1&sni=www.bing.com#%E3%80%90%E5%BC%B1%E7%BD%91%E6%95%91%E6%98%9F%E3%80%91Hysteria%202%20(UDP%E7%AB%AF%E5%8F%A3%E8%B7%B3%E8%B7%83)"
-    LINK_XHTTP="vless://${UUID}@${host_ip}:${PORT_XHTTP}?encryption=none&security=tls&sni=www.bing.com&type=xhttp&path=%2Fxraybox-${UUID}&mode=auto&insecure=1&pcs=${CERT_SHA256}&pinnedPeerCertSha256=${CERT_SHA256}#%E3%80%90%E5%AE%B9%E7%81%BE%E9%98%B2%E5%B0%81%E3%80%91VLESS%20%2B%20XHTTP%20%2B%20TLS%20(%E5%8F%AF%E5%A5%97CDN)"
+    local fragment_reality fragment_hy2 fragment_xhttp
+    fragment_reality=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe="-._~"))' 'REALITY-VLESS+XTLS-Vision-（主力节点）')
+    fragment_hy2=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe="-._~"))' 'Hysteria 2-（UDP端口跳跃）')
+    fragment_xhttp=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe="-._~"))' 'XHTTP-VLESS+TLS-(可套CDN+WARP)')
+    LINK_REALITY="vless://${UUID}@${host_ip}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#${fragment_reality}"
+    LINK_HY2="hysteria2://${UUID}@${host_ip}:${PORT_HY2}?mport=${PORT_HOP_PORTS//,/%2C}&security=tls&alpn=h3&insecure=1&sni=${TLS_SNI}#${fragment_hy2}"
+    LINK_XHTTP="vless://${UUID}@${host_ip}:${PORT_XHTTP}?encryption=none&security=tls&sni=${TLS_SNI}&type=xhttp&path=%2Fxraybox-${UUID}&mode=auto&pcs=${CERT_SHA256}&pinnedPeerCertSha256=${CERT_SHA256}#${fragment_xhttp}"
 
     cat > "${NODES_TXT}" <<EOF
 ========================================================================
                       ToFu 节点配置直连与备份
 ========================================================================
-【节点1】VLESS + REALITY + XTLS-Vision (日常主力)
+【节点1】REALITY-VLESS+XTLS-Vision-（主力节点）
 ${LINK_REALITY}
 
-【节点2】Hysteria 2 (UDP端口跳跃)
+【节点2】Hysteria 2-（UDP端口跳跃）
 ${LINK_HY2}
 
-【节点3】VLESS + XHTTP + TLS (可套CDN+WARP)
+【节点3】XHTTP-VLESS+TLS-(可套CDN+WARP)
 ${LINK_XHTTP}
 ========================================================================
 EOF
+    chmod 600 "${NODES_TXT}"
 }
 
 show_cdn_tutorial() {
@@ -725,7 +1105,7 @@ show_cdn_tutorial() {
 
     echo -e "${cyan}------------------------------------------------------------------------${plain}"
     echo -e "【步骤 4：客户端 (如 v2rayN) 编辑设置】"
-    echo -e "  1. 在 Windows v2rayN 中双击打开导入的【容灾防封】节点编辑界面；"
+    echo -e "  1. 在 Windows v2rayN 中双击打开导入的【XHTTP】节点编辑界面；"
     echo -e "  2. 修改以下基础连接信息："
     echo -e "     - 地址 (Address)  : 改为 ccc.bbb.aaa.com (或 Cloudflare 官方优选 IP)"
     echo -e "     - 端口 (Port)     : 改为 ${PORT_XHTTP:-2053} (或 Cloudflare 支持的 HTTPS 端口: 443、2083、2087、2096、8443)"
@@ -768,49 +1148,55 @@ show_node_info() {
     echo -e "${cyan}========================================================================${plain}"
     echo -e "              ${bold}${green}🎉  ToFu 节点部署完成！${plain}"
     echo -e "${cyan}========================================================================${plain}"
-    echo -e "✅ 提示：双击或鼠标三击即可整行全选链接；或者三条链接全选复制；链接已同步写入 ${NODES_TXT}"
+    echo -e "✅ 提示：复制以下客户端链接，或回车使用二维码，导入代理工具；链接已同步写入 ${NODES_TXT}"
+    echo -e "✅ 提示：Hysteria 2 节点，如果在V2rayN客户端中使用，务必将配置右上角的Core类型更改为sing-box"
     echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
-    echo -e "${bold}${yellow}【节点1】VLESS + REALITY + XTLS-Vision (日常主力)${plain}"
+    echo -e "${bold}${yellow}【节点1】REALITY-VLESS+XTLS-Vision-（主力节点）${plain}"
     echo -e "${cyan}${LINK_REALITY}${plain}"
     echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
-    echo -e "${bold}${yellow}【节点2】Hysteria 2 (UDP端口跳跃)${plain}"
+    echo -e "${bold}${yellow}【节点2】Hysteria 2-（UDP端口跳跃）${plain}"
     echo -e "${cyan}${LINK_HY2}${plain}"
     echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
-    echo -e "${bold}${yellow}【节点3】VLESS + XHTTP + TLS (可套CDN+WARP)${plain}"
+    echo -e "${bold}${yellow}【节点3】XHTTP-VLESS+TLS-(可套CDN+WARP)${plain}"
     echo -e "${cyan}${LINK_XHTTP}${plain}"
     echo -e "${cyan}========================================================================${plain}"
     echo -e "  ${green}1.${plain} 显示所有节点二维码 (依次输出 3 个节点二维码，回车默认)"
+    echo
     echo -e "  ${green}2.${plain} 仅显示 【节点1】VLESS + REALITY 节点二维码"
+    echo
     echo -e "  ${green}3.${plain} 仅显示 【节点2】Hysteria 2 (带端口跳跃) 节点二维码"
+    echo
     echo -e "  ${green}4.${plain} 仅显示 【节点3】VLESS + XHTTP 节点二维码"
+    echo
     echo -e "  ${green}5.${plain} Cloudflare CDN + WARP 专区"
+    echo
     echo -e "  ${green}0.${plain} 返回管理菜单"
     echo -e "${cyan}========================================================================${plain}"
     read -rp "请输入选项 [默认: 1]: " qr_choice
     qr_choice=${qr_choice:-1}
     case "$qr_choice" in
         1)
-            show_qr "【节点1】VLESS + REALITY + XTLS-Vision" "${LINK_REALITY}"
-            show_qr "【节点2】Hysteria 2 (带端口跳跃)" "${LINK_HY2}"
-            show_qr "【节点3】VLESS + XHTTP + TLS" "${LINK_XHTTP}"
+            show_qr "REALITY-VLESS+XTLS-Vision-（主力节点）" "${LINK_REALITY}"
+            show_qr "Hysteria 2-（UDP端口跳跃）" "${LINK_HY2}"
+            show_qr "XHTTP-VLESS+TLS-(可套CDN+WARP)" "${LINK_XHTTP}"
             echo -e "\n按任意键返回管理菜单..."
             read -n 1 -s -r
             main_menu
             ;;
         2)
-            show_qr "【节点1】VLESS + REALITY + XTLS-Vision" "${LINK_REALITY}"
+            show_qr "REALITY-VLESS+XTLS-Vision-（主力节点）" "${LINK_REALITY}"
             echo -e "\n按任意键返回管理菜单..."
             read -n 1 -s -r
             main_menu
             ;;
         3)
-            show_qr "【节点2】Hysteria 2 (带端口跳跃)" "${LINK_HY2}"
+            show_qr "Hysteria 2-（UDP端口跳跃）" "${LINK_HY2}"
             echo -e "\n按任意键返回管理菜单..."
             read -n 1 -s -r
             main_menu
             ;;
         4)
-            show_qr "【节点3】VLESS + XHTTP + TLS" "${LINK_XHTTP}"
+            show_qr "XHTTP-VLESS+TLS-(可套CDN+WARP)" "${LINK_XHTTP}"
             echo -e "\n按任意键返回管理菜单..."
             read -n 1 -s -r
             main_menu
@@ -836,7 +1222,7 @@ install_all() {
     check_arch
     check_os
 
-    install_deps
+    install_deps || { error "依赖安装失败；已停止部署，请按包管理器输出检查原因。"; return 1; }
     enable_bbr
     get_public_ip
     scan_and_display_ports
@@ -845,43 +1231,52 @@ install_all() {
     echo -e "✅ 提示：如果你使用的是主流云服务商（如 AWS、甲骨文 Oracle、谷歌云 GCP、"
     echo -e "   腾讯云/阿里云国际、Hetzner、搬瓦工等），务必在云服务器后台的"
     echo -e "   “安全组 / 防火墙（Security Group / Firewall）”中至少开放以下端口："
-    echo -e "   ✅ ${green}443、8443、2053、20000 ~ 40000${plain} (或自定义端口)"
-    echo -e "✅ 提示：如果你的 VPS 是纯系统自带防火墙（无外部安全组拦截），"
-    echo -e "   脚本内置程序会自动配置处理，无需手动操作。"
+    echo -e "   ${green}443、8443、2053、20000 ~ 50000${plain} (或自定义端口)"
     echo -e "${cyan}========================================================================${plain}"
 
     echo -e "\n${bold}${cyan}ToFu 节点部署将生成 3 套核心协议组合：${plain}\n"
 
-    echo -e "✅ ${bold}${yellow}节点 1【主力旗舰】：${plain}"
+    echo -e "✅ ${bold}${yellow}节点 1【REALITY】：${plain}"
     echo -e "   ${bold}VLESS + REALITY + XTLS-Vision${plain}"
     echo -e "   ├─ 协议架构: 应用层 VLESS │ 安全层 REALITY │ 传输层 TCP │ 流控 XTLS-Vision"
     echo -e "   ├─ 端口分配: 端口 443 (TCP)"
-    echo -e "   ├─ 核心定位: 【日常主力直连】"
+    echo -e "   ├─ 核心定位: 【主力直连】"
     echo -e "   ├─ 特点属性: 无需域名、免证书、CPU 占用几乎为 0，适合轻量主机，不可套 CDN"
     echo -e "   └─ 调度内核: 客户端调度 ${green}Xray${plain} 内核\n"
 
-    echo -e "✅ ${bold}${yellow}节点 2【弱网救星】：${plain}"
+    echo -e "✅ ${bold}${yellow}节点 2【Hysteria 2】：${plain}"
     echo -e "   ${bold}Hysteria 2 (UDP 端口跳跃)${plain}"
     echo -e "   ├─ 协议架构: 应用层 Hysteria 2 │ 传输层 UDP (Brutal) │ 内核 NAT 端口跳跃"
-    echo -e "   ├─ 端口分配: 主端口 8443 │ 动态跳跃段 20000:40000 (共 20001 个可用端口)"
-    echo -e "   ├─ 核心定位: 【高吞吐强推】"
-    echo -e "   ├─ 特点属性: 暴力拥塞控制抗 30%~50% 丢包、动态跳跃突破运营商 UDP QoS，适合晚高峰，不可套 CDN"
+    echo -e "   ├─ 端口分配: 主端口 8443 │ 动态跳跃段 ${DEFAULT_HOP_PORTS}"
+    echo -e "   ├─ 核心定位: 【暴力带宽】"
+    echo -e "   ├─ 特点属性: 面向 UDP 网络与高延迟/丢包场景；实际速度和稳定性取决于网络，不可套 CDN"
     echo -e "   └─ 调度内核: 客户端调度 ${green}sing-box${plain} 内核\n"
 
-    echo -e "✅ ${bold}${yellow}节点 3【容灾防封】：${plain}"
+    echo -e "✅ ${bold}${yellow}节点 3【XHTTP】：${plain}"
     echo -e "   ${bold}VLESS + XHTTP + TLS (可套CDN+WARP)${plain}"
     echo -e "   ├─ 协议架构: 应用层 VLESS │ 传输层 XHTTP │ 安全层 TLS │ 分流扩展 Cloudflare WARP 出口"
     echo -e "   ├─ 端口分配: 端口 2053 (TCP)"
-    echo -e "   ├─ 核心定位: 【容灾防封备用】"
-    echo -e "   ├─ 特点属性: 秒救被墙 IP；可直连、可套不死 CDN 实现隐匿 VPS 真实物理 IP"
+    echo -e "   ├─ 核心定位: 【多样化DIY】"
+    echo -e "   ├─ 特点属性: 可直连或经 Cloudflare CDN 回源；源站地址仍可能因 DNS 或旁路访问暴露"
     echo -e "   └─ 调度内核: 客户端调度 ${green}Xray${plain} 内核\n"
 
     echo -e "${cyan}============================ 请选择部署模式 ============================${plain}"
     echo -e "  ${green}1.${plain} 小白模式 (回车即可，自动分配端口)"
+    echo
     echo -e "  ${green}2.${plain} 自定义端口与参数模式"
+    echo
+    echo -e "  ${green}0.${plain} 取消安装并返回"
     echo -e "${cyan}========================================================================${plain}"
     read -rp "请输入模式编号 [默认: 1]: " mode_choice
     mode_choice=${mode_choice:-1}
+
+    if [[ "$mode_choice" == "0" ]]; then
+        info "已取消安装。"
+        return 0
+    elif [[ "$mode_choice" != "1" && "$mode_choice" != "2" ]]; then
+        warn "无效选项，已取消安装。"
+        return 1
+    fi
 
     if [[ "$mode_choice" == "2" ]]; then
         echo -e "\n${cyan}--- 进入自定义参数配置 ---${plain}"
@@ -908,19 +1303,27 @@ install_all() {
         done
 
         while true; do
-            read -rp "请输入 Hysteria 2 端口跳跃起始端口 [默认: 20000]: " user_hop_start
-            user_hop_start=${user_hop_start:-20000}
-            read -rp "请输入 Hysteria 2 端口跳跃结束端口 [默认: 40000]: " user_hop_end
-            user_hop_end=${user_hop_end:-40000}
-            if [[ "$user_hop_start" =~ ^[0-9]+$ && "$user_hop_end" =~ ^[0-9]+$ ]] && \
-               [ "$user_hop_start" -ge 1 ] && [ "$user_hop_end" -le 65535 ] && \
-               [ "$user_hop_start" -lt "$user_hop_end" ]; then
-                PORT_HOP_START=$user_hop_start
-                PORT_HOP_END=$user_hop_end
-                break
-            else
-                warn "端口跳跃范围无效 (起始必须小于结束，1-65535)，请重新输入！"
+            echo
+            echo "Hy2 跳跃端口格式："
+            echo "  1. 多个单端口（例：1234,5678,9012）"
+            echo "  2. 连续端口范围（例：20000-50000）"
+            echo "  3. 端口组合（例：1234,5000-6000,7044,8000-9000）"
+            read -rp "请选择格式 [默认: 2]: " hop_mode
+            hop_mode=${hop_mode:-2}
+            case "$hop_mode" in
+                1) read -rp "请输入单端口列表（英文逗号分隔）: " user_hop_ports ;;
+                2) read -rp "请输入端口范围（例如 20000-50000）[默认: 20000-50000]: " user_hop_ports
+                   user_hop_ports=${user_hop_ports:-$DEFAULT_HOP_PORTS} ;;
+                3) read -rp "请输入端口组合（英文逗号分隔，范围用连字符）: " user_hop_ports ;;
+                *) warn "请选择 1、2 或 3。"; continue ;;
+            esac
+            if ! validate_hop_ports "$user_hop_ports"; then
+                warn "格式或端口范围不正确。单端口用英文逗号，范围用连字符；端口须为 1025-65535，范围起点不能大于终点。"
+                continue
             fi
+            if ! check_hop_ports_available "$user_hop_ports"; then continue; fi
+            PORT_HOP_PORTS=$user_hop_ports
+            break
         done
 
         while true; do
@@ -936,13 +1339,25 @@ install_all() {
 
         read -rp "请输入 REALITY 伪装域名 [回车自动智能探测最优 SNI]: " user_sni
         if [[ -n "$user_sni" ]]; then
-            REALITY_SNI="$user_sni"
+            if [[ "$user_sni" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
+                REALITY_SNI="${user_sni,,}"
+            else
+                warn "域名格式无效，将重新输入。"
+                read -rp "请重新输入 REALITY 域名（留空自动探测）: " user_sni_retry
+                if [[ -z "$user_sni_retry" ]]; then
+                    probe_best_sni
+                elif [[ "$user_sni_retry" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
+                    REALITY_SNI="${user_sni_retry,,}"
+                else
+                    error "域名格式仍无效，停止安装。"
+                    return 1
+                fi
+            fi
         else
             probe_best_sni
         fi
     else
-        PORT_HOP_START=20000
-        PORT_HOP_END=40000
+        PORT_HOP_PORTS=$DEFAULT_HOP_PORTS
 
         if check_port_occupied 443 "tcp"; then
             warn "端口 443 已被占用，正在动态寻找可用高位端口..."
@@ -966,11 +1381,13 @@ install_all() {
         probe_best_sni
     fi
 
-    echo -e "\n${cyan}========================================================================${plain}"
-    info "选定端口: REALITY: ${PORT_REALITY}, Hysteria2: ${PORT_HY2} (跳跃段: ${PORT_HOP_START}-${PORT_HOP_END}), XHTTP: ${PORT_XHTTP}"
+    TLS_SNI=${REALITY_SNI}
 
-    configure_firewalls "${PORT_REALITY}" "${PORT_HY2}" "${PORT_XHTTP}" "${PORT_HOP_START}" "${PORT_HOP_END}"
-    install_xray_core
+    echo -e "\n${cyan}========================================================================${plain}"
+    info "选定端口: REALITY: ${PORT_REALITY}, Hysteria2 主端口: ${PORT_HY2}，跳跃端口: ${PORT_HOP_PORTS}, XHTTP: ${PORT_XHTTP}"
+
+    configure_firewalls "${PORT_REALITY}" "${PORT_HY2}" "${PORT_XHTTP}" "${PORT_HOP_PORTS}"
+    install_xray_core || { error "Xray 核心安装失败，停止部署。"; return 1; }
     generate_credentials
     setup_iptables_port_hopping
     generate_server_config
@@ -980,20 +1397,27 @@ install_all() {
     if [[ -f "$0" && ! "$0" =~ ^/dev/fd/ && ! "$0" =~ ^/proc/ && "$0" != "bash" && "$0" != "-bash" && "$0" != "sh" ]]; then
         cp -f "$0" "${CONFIG_DIR}/tofu.sh" >/dev/null 2>&1
         cp -f "$0" "${TOFU_BIN}" >/dev/null 2>&1
+        local source_path
+        source_path=$(readlink -f "$0" 2>/dev/null || true)
+        if [[ -n "$source_path" && "$(basename "$source_path")" == "tofu.sh" && "$source_path" != "$TOFU_BIN" ]]; then
+            printf '%s\n' "$source_path" > "${CONFIG_DIR}/install_source_path"
+            chmod 600 "${CONFIG_DIR}/install_source_path"
+        fi
     elif [[ -s "${CONFIG_DIR}/tofu.sh" ]]; then
         cp -f "${CONFIG_DIR}/tofu.sh" "${TOFU_BIN}" >/dev/null 2>&1
     else
         local script_src="https://raw.githubusercontent.com/YGGYDW/ToFu/refs/heads/main/tofu.sh"
-        local script_mirror="https://ghproxy.net/${script_src}"
         echo -e "${cyan}[下载]${plain} 正在注册全局快捷命令 tofu..."
-        if curl -L --progress-bar --connect-timeout 5 -m 15 "${script_src}" -o "${CONFIG_DIR}/tofu.sh" 2>/dev/null; then
-            echo -e "${green}.........................................✅${plain}"
-        elif curl -L --progress-bar --connect-timeout 5 -m 15 "${script_mirror}" -o "${CONFIG_DIR}/tofu.sh" 2>/dev/null; then
-            echo -e "${green}.........................................✅${plain}"
-        elif wget -q -T 10 -O "${CONFIG_DIR}/tofu.sh" "${script_src}" 2>/dev/null; then
-            echo -e "${green}.........................................✅${plain}"
+        local script_tmp="${CONFIG_DIR}/tofu.sh.download"
+        if curl_with_progress "下载 ToFu 更新" --retry 2 --connect-timeout 8 -m 60 "${script_src}" -o "$script_tmp" && bash -n "$script_tmp"; then
+            install -m 700 "$script_tmp" "${CONFIG_DIR}/tofu.sh"
+            install -m 755 "$script_tmp" "${TOFU_BIN}"
+            rm -f "$script_tmp"
+            success "ToFu 管理命令下载并通过 Bash 语法检查。"
+        else
+            rm -f "$script_tmp"
+            warn "无法从项目官方地址下载管理命令；当前服务已安装，但全局 tofu 命令未注册。"
         fi
-        [[ -s "${CONFIG_DIR}/tofu.sh" ]] && cp -f "${CONFIG_DIR}/tofu.sh" "${TOFU_BIN}" >/dev/null 2>&1
     fi
     chmod +x "${TOFU_BIN}" >/dev/null 2>&1
     chmod +x "${CONFIG_DIR}/tofu.sh" >/dev/null 2>&1
@@ -1002,15 +1426,25 @@ install_all() {
 }
 
 uninstall_all() {
-    warn "正在彻底卸载 ToFu 套件及所有相关配置..."
+    clear
+    show_logo
+    echo -e "${yellow}此操作将完整卸载 ToFu：停止服务、删除 ToFu 文件与规则，并恢复可识别的安装前系统设置。${plain}"
+    read -rp "确认完整卸载 ToFu？[Y/n]: " delete_confirm
+    if [[ "$delete_confirm" == "n" || "$delete_confirm" == "N" ]]; then
+        info "已取消卸载。"
+        main_menu
+        return 0
+    elif [[ -n "$delete_confirm" && "$delete_confirm" != "y" && "$delete_confirm" != "Y" ]]; then
+        warn "输入无效，已取消卸载。"
+        main_menu
+        return 1
+    fi
+    local install_source_path=""
+    [[ -f "${CONFIG_DIR}/install_source_path" ]] && IFS= read -r install_source_path < "${CONFIG_DIR}/install_source_path"
     load_env_data
 
-    if command -v warp-cli >/dev/null 2>&1; then
-        warp-cli disconnect >/dev/null 2>&1 || true
-    fi
-
     if [[ -f "${IPTABLES_SCRIPT}" ]]; then
-        /bin/bash "${IPTABLES_SCRIPT}" disable "${PORT_HY2}" "${PORT_HOP_START}" "${PORT_HOP_END}" >/dev/null 2>&1
+        /bin/bash "$IPTABLES_SCRIPT" disable "${PORT_HY2}" "${PORT_HOP_PORTS}" >/dev/null 2>&1 || true
     fi
 
     if [[ -d /run/systemd/system ]] || pidof systemd >/dev/null 2>&1; then
@@ -1024,18 +1458,45 @@ uninstall_all() {
         rm -f "${OPENRC_FILE}"
     fi
 
-    killall -9 xray >/dev/null 2>&1 || true
-    rm -f "${XRAY_BIN}"
+    stop_fallback_service
+
+    if [[ -f "${CONFIG_DIR}/xray.original" ]]; then
+        cp -p "${CONFIG_DIR}/xray.original" "${XRAY_BIN}"
+    elif [[ -f "${CONFIG_DIR}/xray_managed" ]]; then
+        rm -f "${XRAY_BIN}"
+    fi
+    restore_managed_asset /usr/local/share/xray/geoip.dat geoip_share
+    restore_managed_asset /usr/local/bin/geoip.dat geoip_bin
+    restore_managed_asset /usr/local/share/xray/geosite.dat geosite_share
+    restore_managed_asset /usr/local/bin/geosite.dat geosite_bin
+    [[ -f "${CONFIG_DIR}/xray_share_dir_managed" ]] && rmdir /usr/local/share/xray 2>/dev/null || true
+    rm -f "$FALLBACK_PID_FILE"
+    if [[ -f "$SYSTEM_STATE_FILE" ]]; then
+        local prior_cc prior_qdisc
+        prior_cc=$(awk -F '\t' '$1=="tcp_congestion_control" {print $2}' "$SYSTEM_STATE_FILE")
+        prior_qdisc=$(awk -F '\t' '$1=="default_qdisc" {print $2}' "$SYSTEM_STATE_FILE")
+        if [[ -f "${CONFIG_DIR}/tofu_bbr_managed" ]]; then rm -f /etc/sysctl.d/99-tofu-bbr.conf; fi
+        [[ -n "$prior_cc" && "$prior_cc" != unknown ]] && sysctl -w "net.ipv4.tcp_congestion_control=$prior_cc" >/dev/null 2>&1 || true
+        [[ -n "$prior_qdisc" && "$prior_qdisc" != unknown ]] && sysctl -w "net.core.default_qdisc=$prior_qdisc" >/dev/null 2>&1 || true
+    fi
+    if [[ -f "${CONFIG_DIR}/warp_managed" || -f "${CONFIG_DIR}/warp_repo_managed" ]]; then
+        command -v warp-cli >/dev/null 2>&1 && warp-cli disconnect >/dev/null 2>&1 || true
+        if [[ -f "${CONFIG_DIR}/warp_managed" ]]; then
+            case "$PKG_MANAGER" in
+                apt-get) run_package_task "卸载 Cloudflare WARP" apt-get remove -y cloudflare-warp || warn "Cloudflare WARP 软件包未能移除。" ;;
+                yum) run_package_task "卸载 Cloudflare WARP" yum remove -y cloudflare-warp || warn "Cloudflare WARP 软件包未能移除。" ;;
+            esac
+        fi
+        rm -f /etc/apt/sources.list.d/cloudflare-warp.list /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg /etc/yum.repos.d/cloudflare-warp.repo
+    fi
+    remove_recorded_packages
     rm -rf "${CONFIG_DIR}"
-    rm -rf /usr/local/share/xray
-    rm -f /usr/local/bin/geoip.dat /usr/local/bin/geosite.dat
     rm -f "${TOFU_BIN}"
-    rm -f /usr/local/bin/xray-box
-    rm -f ~/tofu.sh ~/xray-box.sh
-    rm -f /etc/apt/sources.list.d/cloudflare-warp.list
-    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    rm -f /etc/yum.repos.d/cloudflare-warp.repo
-    success "ToFu 套件已彻底干净卸载，未残留任何系统垃圾！"
+    if [[ "$install_source_path" == /* && "$(basename "$install_source_path")" == "tofu.sh" && "$install_source_path" != "$TOFU_BIN" && "$install_source_path" != "$CONFIG_DIR"/* ]]; then
+        rm -f -- "$install_source_path"
+    fi
+    success "ToFu 服务、程序文件、配置、可识别规则及 ToFu 安装的 WARP 组件已清理。"
+    echo "如果你从任意临时路径直接运行过下载的 tofu.sh，该脚本副本不在 ToFu 安装清单中，请自行删除。"
 }
 
 start_service() {
@@ -1050,8 +1511,7 @@ start_service() {
         rc-service tofu start
         success "服务已成功启动。"
     else
-        killall -9 xray >/dev/null 2>&1 || true
-        nohup "${XRAY_BIN}" run -config "${CONFIG_FILE}" >/dev/null 2>&1 &
+        start_fallback_service
         success "服务已成功启动。"
     fi
 }
@@ -1063,7 +1523,7 @@ stop_service() {
     elif command -v rc-service >/dev/null 2>&1; then
         rc-service tofu stop >/dev/null 2>&1
     fi
-    killall -9 xray >/dev/null 2>&1 || true
+    stop_fallback_service
     success "ToFu 服务已成功停止。"
 }
 
@@ -1074,23 +1534,15 @@ restart_service() {
             success "服务已重启完毕。"
         else
             error "服务重启失败！请运行 'journalctl -u tofu -n 30' 查看错误日志。"
+            return 1
         fi
     elif command -v rc-service >/dev/null 2>&1; then
-        rc-service tofu restart
+        rc-service tofu restart || { error "OpenRC 服务重启失败。"; return 1; }
         success "服务已重启完毕。"
     else
-        killall -9 xray >/dev/null 2>&1 || true
-        nohup "${XRAY_BIN}" run -config "${CONFIG_FILE}" >/dev/null 2>&1 &
+        stop_fallback_service
+        start_fallback_service || { error "ToFu 后台进程启动失败。"; return 1; }
         success "服务已重启完毕。"
-    fi
-}
-
-view_logs() {
-    info "正在输出最近 50 条实时运行日志 (按 Ctrl+C 退出)..."
-    if [[ -d /run/systemd/system ]]; then
-        journalctl -u tofu -f -n 50
-    else
-        error "当前非 systemd 环境，无法直接跟踪日志。"
     fi
 }
 
@@ -1100,10 +1552,18 @@ upgrade_xray_core() {
     check_os
     local current_ver
     current_ver=$("${XRAY_BIN}" version 2>/dev/null | head -n 1 | awk '{print $2}')
-    local latest_tag
-    latest_tag=$(curl -sSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | jq -r .tag_name 2>/dev/null)
-    if [[ -z "${latest_tag}" || "${latest_tag}" == "null" ]]; then
+    local latest_tag release_api
+    release_api=$(mktemp) || return 1
+    if ! curl -fLsS --connect-timeout 10 --max-time 60 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" -o "$release_api"; then
         error "获取 GitHub 最新版本失败，请检查网络！"
+        rm -f "$release_api"
+        read -n 1 -s -r -p "按任意键返回菜单..."
+        return 1
+    fi
+    latest_tag=$(jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$release_api" 2>/dev/null) || latest_tag=""
+    rm -f "$release_api"
+    if [[ -z "$latest_tag" ]]; then
+        error "官方版本号缺失或格式异常，已停止升级。"
         read -n 1 -s -r -p "按任意键返回菜单..."
         return 1
     fi
@@ -1116,9 +1576,28 @@ upgrade_xray_core() {
             return 0
         fi
     fi
-    install_xray_core
-    restart_service
-    success "Xray-core 已成功平滑升级至 ${latest_tag}！"
+    local backup_bin="${CONFIG_DIR}/xray.upgrade-backup"
+    if [[ -x "$XRAY_BIN" ]]; then cp -p "$XRAY_BIN" "$backup_bin" || { error "无法备份当前 Xray，已停止升级。"; return 1; }; fi
+    if ! install_xray_core; then
+        rm -f "$backup_bin"
+        read -n 1 -s -r -p "按任意键返回菜单..."
+        return 1
+    fi
+    if [[ -f "$CONFIG_FILE" ]] && ! "$XRAY_BIN" -test -config "$CONFIG_FILE"; then
+        error "新版本配置检查失败，正在恢复旧核心。"
+        [[ -f "$backup_bin" ]] && mv -f "$backup_bin" "$XRAY_BIN"
+        read -n 1 -s -r -p "按任意键返回菜单..."
+        return 1
+    fi
+    if ! restart_service; then
+        error "新核心启动失败，正在恢复旧版本。"
+        [[ -f "$backup_bin" ]] && mv -f "$backup_bin" "$XRAY_BIN"
+        restart_service || true
+        read -n 1 -s -r -p "按任意键返回菜单..."
+        return 1
+    fi
+    rm -f "$backup_bin"
+    success "Xray-core 已成功升级至 ${latest_tag}！"
     read -n 1 -s -r -p "按任意键返回菜单..."
 }
 
@@ -1156,7 +1635,8 @@ get_system_info_banner() {
 
     echo -e "   本机 IP  : ${cyan}${IP:-检测中}${plain} │ 系统环境: ${yellow}${os_pretty}${plain}"
     echo -e "   核心版本 : ${cyan}Xray-core ${xray_ver:-v26}${plain} │ TCP BBR : ${bbr_str}"
-    echo -e "   运行端口 : REALITY: ${green}${PORT_REALITY:-443}${plain} │ Hy2: ${green}${PORT_HY2:-8443}${plain} (${PORT_HOP_START:-20000}:${PORT_HOP_END:-40000}) │ XHTTP: ${green}${PORT_XHTTP:-2053}${plain}"
+    echo -e "   运行端口 : 节点1：REALITY: ${green}${PORT_REALITY:-443}${plain} │ 节点2 Hy2: ${green}${PORT_HY2:-8443}${plain} (${PORT_HOP_PORTS:-$DEFAULT_HOP_PORTS}) │ 节点3：XHTTP: ${green}${PORT_XHTTP:-2053}${plain}"
+    echo -e "   当前XHTTP出站状态：$(get_cf_egress_status)"
 }
 
 get_cf_egress_status() {
@@ -1168,15 +1648,114 @@ get_cf_egress_status() {
 }
 
 get_cf_egress_banner() {
+    local title color frame
     if [[ -f "${CONFIG_FILE}" ]] && grep -q '"outboundTag": "warp-socks"' "${CONFIG_FILE}" 2>/dev/null; then
-        echo -e "  ${green}╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮${plain}"
-        echo -e "  ${green}│${plain}  ${green}${bold}● Cloudflare WARP 100% 闭环出口${plain} │ ${cyan}目标网站查 IP 100% 显示 Cloudflare  ${plain} ${green}│${plain}"
-        echo -e "  ${green}╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯${plain}"
+        title="● Cloudflare WARP"
+        color=$green
     else
-        echo -e "  ${yellow}╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮${plain}"
-        echo -e "  ${yellow}│${plain}  ${yellow}${bold}○ 原生 VPS 直连出口${plain}             │ ${cyan}目标网站查 IP 显示 VPS 真实物理 IP${plain} ${yellow}│${plain}"
-        echo -e "  ${yellow}╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯${plain}"
+        title="○ 原生 VPS 直连"
+        color=$yellow
     fi
+    frame=$(python3 - "$title" <<'PY'
+import sys, unicodedata
+status = sys.argv[1]
+lines = ["ToFu · 出站状态", status]
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+w = max(width(s) for s in lines)
+def row(s):
+    print("│ " + s + " " * (w - width(s)) + " │")
+print("╭" + "─" * (w + 2) + "╮")
+row(lines[0])
+print("├" + "─" * (w + 2) + "┤")
+row(lines[1])
+print("╰" + "─" * (w + 2) + "╯")
+PY
+)
+    echo -e "${color}${frame}${plain}"
+}
+
+show_warp_success_card() {
+    local frame
+    frame=$(python3 <<'PY'
+import unicodedata
+lines = ["节点 3 XHTTP-VLESS+TLS 节点", "✅已成功配置 WARP 出站✅"]
+def width(s):
+    return sum(0 if unicodedata.category(c) in ("Mn", "Cf") else 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+w = max(width(s) for s in lines)
+def row(s):
+    padding = w - width(s)
+    left = padding // 2
+    right = padding - left
+    print("│ " + " " * left + s + " " * right + " │")
+print("╭" + "─" * (w + 2) + "╮")
+row(lines[0])
+print("├" + "─" * (w + 2) + "┤")
+row(lines[1])
+print("╰" + "─" * (w + 2) + "╯")
+PY
+)
+    echo -e "${green}${frame}${plain}"
+}
+
+set_xhttp_warp_egress() {
+    local enabled=$1 tmp backup
+    tmp=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX") || return 1
+    backup=$(mktemp "${CONFIG_FILE}.bak.XXXXXX") || { rm -f "$tmp"; return 1; }
+    cp -p "$CONFIG_FILE" "$backup" || { rm -f "$tmp" "$backup"; return 1; }
+    cp "$CONFIG_FILE" "$tmp" || { rm -f "$tmp" "$backup"; return 1; }
+    if ! python3 - "$tmp" "$enabled" <<'PY'
+import json, sys
+p, enabled = sys.argv[1], sys.argv[2] == "on"
+with open(p, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+rules = cfg.setdefault("routing", {}).setdefault("rules", [])
+found = False
+for rule in rules:
+    if rule.get("inboundTag") == ["vless-xhttp"]:
+        rule["outboundTag"] = "warp-socks" if enabled else "direct"
+        found = True
+if not found:
+    raise SystemExit("XHTTP inbound route was not found")
+if enabled and not any(x.get("tag") == "warp-socks" for x in cfg.get("outbounds", [])):
+    cfg.setdefault("outbounds", []).append({
+        "tag": "warp-socks", "protocol": "socks",
+        "settings": {"servers": [{"address": "127.0.0.1", "port": 40000}]}
+    })
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    f.flush()
+    import os
+    os.fsync(f.fileno())
+PY
+    then
+        error "修改 Xray 路由配置失败，原配置未变更。"
+        rm -f "$tmp" "$backup"
+        return 1
+    fi
+    chmod --reference="$CONFIG_FILE" "$tmp" 2>/dev/null || chmod 600 "$tmp"
+    mv -f "$tmp" "$CONFIG_FILE" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
+    if ! restart_service; then
+        error "服务未能使用新路由启动，正在恢复旧配置。"
+        mv -f "$backup" "$CONFIG_FILE"
+        restart_service || true
+        return 1
+    fi
+    rm -f "$backup"
+    return 0
+}
+
+confirm_warp_toggle() {
+    local answer
+    if ! read -r -p "确认切换吗？[Y/n]: " answer; then
+        warn "未读取到确认输入，本次不切换。"
+        return 1
+    fi
+    case "$answer" in
+        ""|y|Y) return 0 ;;
+        n|N) info "已取消切换。"; return 1 ;;
+        *) warn "输入无效；请输入 y 或 n，本次不切换。"; return 1 ;;
+    esac
 }
 
 toggle_cf_egress() {
@@ -1194,51 +1773,72 @@ toggle_cf_egress() {
     if [[ "$is_cf_on" == true ]]; then
         echo -e "当前状态: ${green}【● Cloudflare WARP 出口模式】${plain}"
         echo -e "即将切换为: ${yellow}【○ 原生 VPS 直连出口模式】${plain}\n"
-        read -rp "确认切换吗？[Y/n]: " confirm_toggle
-        if [[ "$confirm_toggle" == "n" || "$confirm_toggle" == "N" ]]; then
-            return 0
-        fi
+        confirm_warp_toggle || return 0
 
         info "正在更新 Xray 路由规则至原生直连..."
-        python3 -c '
-import json, sys
-p = sys.argv[1]
-with open(p, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-for r in cfg.get("routing", {}).get("rules", []):
-    if r.get("inboundTag") == ["vless-xhttp"]:
-        r["outboundTag"] = "direct"
-with open(p, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
-' "${CONFIG_FILE}"
-        restart_service
+        set_xhttp_warp_egress off || { read -n 1 -s -r -p "按任意键返回 Cloudflare CDN+WARP 专区..."; return 1; }
         success "已成功切换为【○ 原生 VPS 直连出口模式】！"
-        echo -e "✅ 此时通过 CDN 访问网站，出口走 VPS 原生网卡。\n"
+        echo -e "✅ 此时为 VPS 原生出站。\n"
         read -n 1 -s -r -p "按任意键返回 Cloudflare CDN+WARP 专区..."
     else
         echo -e "当前状态: ${yellow}【○ 原生 VPS 直连出口模式】${plain}"
-        echo -e "即将切换为: ${green}【● 100% Cloudflare WARP 出口模式】${plain}\n"
-        read -rp "确认切换吗？[Y/n]: " confirm_toggle
-        if [[ "$confirm_toggle" == "n" || "$confirm_toggle" == "N" ]]; then
-            return 0
-        fi
+        echo -e "即将切换为: ${green}【● Cloudflare WARP 出口模式】${plain}\n"
+        confirm_warp_toggle || return 0
 
         if ! command -v warp-cli >/dev/null 2>&1; then
             info "正在初次安装 Cloudflare 官方 WARP 出口组件..."
             if [[ "${PKG_MANAGER}" == "apt-get" ]]; then
-                apt-get install -y -q curl gpg >/dev/null 2>&1
+                record_new_packages curl gpg
+                if ! run_package_task "准备 WARP 安装工具" apt-get install -y curl gpg; then
+                    error "安装 curl/gpg 依赖失败；请根据上方包管理器输出排查。"
+                    return 1
+                fi
                 echo -e "${cyan}[下载]${plain} 正在拉取 Cloudflare 认证密钥..."
-                curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null && echo -e "${green}.........................................✅${plain}"
+                local warp_key_tmp
+                warp_key_tmp=$(mktemp)
+                mkdir -p /usr/share/keyrings
+                if ! curl_with_progress "下载 Cloudflare 认证密钥" https://pkg.cloudflareclient.com/pubkey.gpg -o "$warp_key_tmp"; then
+                    rm -f "$warp_key_tmp"
+                    error "Cloudflare 仓库公钥下载失败。"
+                    return 1
+                fi
+                if ! gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$warp_key_tmp"; then
+                    rm -f "$warp_key_tmp"
+                    error "Cloudflare 仓库公钥导入失败。"
+                    return 1
+                fi
+                rm -f "$warp_key_tmp"
+                chmod 644 /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+                touch "${CONFIG_DIR}/warp_repo_managed"
+                success "Cloudflare 认证密钥已导入。"
                 local codename
                 codename=$(grep VERSION_CODENAME /etc/os-release 2>/dev/null | cut -d'=' -f2)
                 [[ -z "$codename" ]] && codename="bookworm"
                 echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" | tee /etc/apt/sources.list.d/cloudflare-warp.list >/dev/null 2>&1
-                apt-get update -y -q >/dev/null 2>&1
-                apt-get install -y -q cloudflare-warp >/dev/null 2>&1
+                chmod 644 /etc/apt/sources.list.d/cloudflare-warp.list
+                if ! run_package_task "更新 Cloudflare 软件包索引" apt-get update; then
+                    error "更新 APT 软件源失败；请根据上方输出检查发行版代号、仓库和密钥权限。"
+                    return 1
+                fi
+                if ! run_package_task "安装 Cloudflare WARP" apt-get install -y cloudflare-warp; then
+                    error "安装 Cloudflare WARP 软件包失败；请根据上方输出排查。"
+                    return 1
+                fi
+                touch "${CONFIG_DIR}/warp_managed"
             elif [[ "${PKG_MANAGER}" == "yum" ]]; then
                 echo -e "${cyan}[下载]${plain} 正在拉取 Cloudflare WARP 仓库配置..."
-                curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo >/dev/null 2>&1 && echo -e "${green}.........................................✅${plain}"
-                yum install -y cloudflare-warp >/dev/null 2>&1
+                mkdir -p /etc/yum.repos.d
+                if ! curl_with_progress "下载 Cloudflare WARP 仓库配置" https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo -o /etc/yum.repos.d/cloudflare-warp.repo; then
+                    error "Cloudflare WARP 仓库配置下载失败。"
+                    return 1
+                fi
+                chmod 644 /etc/yum.repos.d/cloudflare-warp.repo
+                touch "${CONFIG_DIR}/warp_repo_managed"
+                if ! run_package_task "安装 Cloudflare WARP" yum install -y cloudflare-warp; then
+                    error "安装 Cloudflare WARP 软件包失败；请根据上方输出排查。"
+                    return 1
+                fi
+                touch "${CONFIG_DIR}/warp_managed"
             fi
         fi
 
@@ -1248,7 +1848,17 @@ with open(p, "w", encoding="utf-8") as f:
             warp-cli --accept-tos mode proxy >/dev/null 2>&1 || warp-cli --accept-tos set-mode proxy >/dev/null 2>&1 || true
             warp-cli --accept-tos proxy port 40000 >/dev/null 2>&1 || warp-cli --accept-tos set-proxy-port 40000 >/dev/null 2>&1 || true
             warp-cli --accept-tos connect >/dev/null 2>&1 || true
-            sleep 2
+            local test_ip=""
+            for _ in {1..5}; do
+                test_ip=$(curl -s4m5 -x socks5h://127.0.0.1:40000 https://api.ipify.org 2>/dev/null || true)
+                [[ -n "$test_ip" ]] && break
+                sleep 2
+            done
+            if [[ -z "$test_ip" ]]; then
+                error "WARP 代理尚未连通，Xray 路由保持原状；请检查 warp-cli status 与网络。"
+                read -n 1 -s -r -p "按任意键返回 Cloudflare CDN+WARP 专区..."
+                return 1
+            fi
         else
             error "安装 Cloudflare 官方客户端失败，请检查 VPS 外网连接！"
             read -n 1 -s -r -p "按任意键返回 Cloudflare CDN 专区..."
@@ -1256,42 +1866,13 @@ with open(p, "w", encoding="utf-8") as f:
         fi
 
         info "正在更新 Xray 路由规则至 Cloudflare 出口..."
-        python3 -c '
-import json, sys
-p = sys.argv[1]
-with open(p, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-
-has_socks = False
-for ob in cfg.get("outbounds", []):
-    if ob.get("tag") == "warp-socks":
-        has_socks = True
-        break
-if not has_socks:
-    cfg.setdefault("outbounds", []).append({
-        "tag": "warp-socks",
-        "protocol": "socks",
-        "settings": {
-            "servers": [{"address": "127.0.0.1", "port": 40000}]
-        }
-    })
-
-for r in cfg.get("routing", {}).get("rules", []):
-    if r.get("inboundTag") == ["vless-xhttp"]:
-        r["outboundTag"] = "warp-socks"
-
-with open(p, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
-' "${CONFIG_FILE}"
-        restart_service
+        set_xhttp_warp_egress on || { read -n 1 -s -r -p "按任意键返回 Cloudflare CDN+WARP 专区..."; return 1; }
         success "已成功切换为【● Cloudflare】出口模式！"
         
-        local test_ip
-        test_ip=$(curl -s4m4 -x socks5://127.0.0.1:40000 https://api.ipify.org 2>/dev/null || echo "")
-        if [[ -n "$test_ip" ]]; then
-            success "出口验证成功！Cloudflare WARP 出口 IP: ${test_ip}"
-        fi
-        echo -e "✅ 此时通过 CDN 访问网站，所有目标网站看到的 IP 100% 为 Cloudflare，真正实现首尾双绝缘！\n"
+        success "WARP 代理出口验证成功，出口 IP: ${test_ip}"
+        echo
+        show_warp_success_card
+        echo
         read -n 1 -s -r -p "按任意键返回 Cloudflare CDN 专区..."
     fi
 }
@@ -1313,19 +1894,21 @@ cloudflare_cdn_menu() {
         echo -e "  │  ▸ 优势: 速度极速、延迟最低。"
         echo -e "  │  ▸ 表现: 在网站查 IP，显示【VPS 真实物理 IP】。"
         echo -e "  │"
-        echo -e "  ${bold}├─ 模式 B【● Cloudflare  WARP 100% 闭环出口】${plain}:"
+        echo -e "  ${bold}├─ 模式 B【● Cloudflare WARP 出口】${plain}:"
         echo -e "  │  ▸ 原理: 入口与出站首尾全走 Cloudflare，VPS 物理真实 IP 全程隐匿。"
-        echo -e "  │  ▸ 优势: 100% 隐藏物理机真实 IP；解除被网站屏蔽的 VPS 出站限制。"
-        echo -e "  │  ▸ 表现: 在网站查 IP，100% 显示【Cloudflare 官方 IP (x.x.x.x)】。"
+        echo -e "  │  ▸ 作用: 节点 3 的出站流量经 WARP 转发；目标站点看到该连接的出口 IP。"
+        echo -e "  │  ▸ 边界: 只影响出站路由，不隐藏 VPS 入站地址，也不代表匿名。"
         echo -e "  │"
-        echo -e "  ${cyan}└─ ✅ 友情提示: 此切换仅对节点 3 生效，节点 1 (REALITY) 与 2 (Hy2) 永远原生直连。${plain}"
+        echo -e "  ${cyan}└─ ✅ 提示: 此切换仅对节点 3 VLESS + XHTTP + TLS 生效。${plain}"
         echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
         echo -e "  ${green}1.${plain} 为节点3【VLESS + XHTTP + TLS】套 CDN 的方法 (步骤说明)"
-        local toggle_label="切换为【● Cloudflare WARP 100% 闭环出口】"
+        echo
+        local toggle_label="切换为【● Cloudflare WARP 出口】"
         if [[ -f "${CONFIG_FILE}" ]] && grep -q '"outboundTag": "warp-socks"' "${CONFIG_FILE}" 2>/dev/null; then
             toggle_label="切换为【○ 原生 VPS 直连出口】"
         fi
         echo -e "  ${green}2.${plain} ${toggle_label}"
+        echo
         echo -e "  ${green}0.${plain} 返回管理菜单"
         echo -e "${cyan}========================================================================${plain}"
         read -rp "请输入操作序号 [0-2]: " cf_choice
@@ -1364,16 +1947,22 @@ main_menu() {
     echo -e "✅ 提示：在终端任意路径输入 ${green}${bold}tofu${plain} 即可随时进入本管理菜单"
     echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
     echo -e "  ${green}1.${plain} 查看所有节点连接信息与二维码"
-    echo -e "  ${green}2.${plain} Cloudflare CDN+WARP 专区 [当前出口: $(get_cf_egress_status)]"
+    echo
+    echo -e "  ${green}2.${plain} Cloudflare CDN+WARP 专区"
+    echo
     echo -e "  ${green}3.${plain} 重启 ToFu 服务"
+    echo
     echo -e "  ${green}4.${plain} 停止 ToFu 服务"
-    echo -e "  ${green}5.${plain} 查看实时运行日志"
-    echo -e "  ${green}6.${plain} 重新安装 / 自定义重置全部配置"
-    echo -e "  ${green}7.${plain} 一键升级 Xray-core 至最新正式版"
-    echo -e "  ${green}8.${plain} 彻底干净卸载 ToFu 套件"
+    echo
+    echo -e "  ${green}5.${plain} 重新安装 / 自定义重置全部配置"
+    echo
+    echo -e "  ${green}6.${plain} 一键升级 Xray-core 核心"
+    echo
+    echo -e "  ${green}7.${plain} 完整卸载 ToFu 组件"
+    echo
     echo -e "  ${green}0.${plain} 退出菜单"
     echo -e "${cyan}========================================================================${plain}"
-    read -rp "请输入操作序号 [0-8]: " choice
+    read -rp "请输入操作序号 [0-7]: " choice
     case "$choice" in
         1) show_node_info ;;
         2) cloudflare_cdn_menu "main" ;;
@@ -1387,13 +1976,12 @@ main_menu() {
             sleep 1
             main_menu
             ;;
-        5) view_logs ;;
-        6) install_all ;;
-        7) 
+        5) install_all ;;
+        6)
             upgrade_xray_core
             main_menu
             ;;
-        8) uninstall_all ;;
+        7) uninstall_all ;;
         0) 
             echo -e "\n✅ 感谢使用 ToFu！随时在终端输入 ${green}tofu${plain} 即可再次唤出管理菜单。\n"
             exit 0 
@@ -1412,11 +2000,10 @@ case "$1" in
     restart)        restart_service ;;
     start)          start_service ;;
     stop)           stop_service ;;
-    log)            view_logs ;;
     cdn)            cloudflare_cdn_menu "main" ;;
     update|upgrade) upgrade_xray_core ;;
     *)
-        if [[ -f "${DATA_FILE}" || -f "/etc/xray-box/node_info.env" ]]; then
+        if [[ -f "${DATA_FILE}" || -f "${CONFIG_FILE}" ]]; then
             main_menu
         else
             install_all
