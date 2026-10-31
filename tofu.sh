@@ -30,17 +30,16 @@ DEFAULT_XHTTP_PORT=2053
 DEFAULT_HOP_PORTS="20000-50000"
 TLS_SNI=""
 DEFAULT_SNI_LIST=(
-    "itunes.apple.com" "www.samsung.com" "download.pda.samsung.com" "www.nvidia.com"
-    "www.speedtest.net" "www.shopify.com" "www.oracle.com" "www.adobe.com" "www.mit.edu"
-    "www.google.com" "www.mozilla.org" "www.bing.com" "www.yahoo.com" "addons.mozilla.org"
-    "www.apple.com" "www.intel.com" "www.amd.com" "www.cisco.com" "www.github.com"
-    "www.paypal.com" "www.ibm.com" "www.dell.com" "www.hp.com" "www.qualcomm.com"
-    "www.wikipedia.org" "www.python.org" "www.rust-lang.org" "www.debian.org" "www.kernel.org"
-    "www.gnu.org" "www.ubuntu.com" "www.redhat.com" "www.fedoraproject.org" "www.archlinux.org"
-    "www.opensuse.org" "www.linuxfoundation.org" "www.nasa.gov" "www.noaa.gov" "www.nist.gov"
-    "www.nih.gov" "www.harvard.edu" "www.stanford.edu" "www.berkeley.edu" "www.cmu.edu"
-    "www.princeton.edu" "www.yale.edu" "www.cam.ac.uk" "www.ox.ac.uk" "www.dropbox.com"
-    "www.salesforce.com"
+    "itunes.apple.com"
+    "gateway.icloud.com"
+    "swdist.apple.com"
+    "updates.cdn-apple.com"
+    "samsung.com"
+    "api.onedrive.com"
+    "speedtest.net"
+    "addons.mozilla.org"
+    "download.docker.com"
+    "amazon.com"
 )
 
 info() { echo -e "${cyan}[信息]${plain} $1"; }
@@ -314,40 +313,59 @@ scan_port_status() {
 scan_and_display_ports() {
     echo -e "${cyan}[端口]${plain} 检查以下端口开放状态:"
     local http_ports=(80 8080 8880 2052 2082 2086 2095)
-    local https_ports=(443 2053 2083 2087 2096 8443)
+    local https_ports=(443 2053 2083 2087 2096)
     local p status
-    echo -e "  * 80系端口 (HTTP)  :"
+    echo -e "  * 80系端口 (HTTP TCP) :"
     for p in "${http_ports[@]}"; do
-        printf "\t[检测 %s ...]" "$p"
+        printf "	[检测 %s ...]" "$p"
         sleep 0.12
         status=$(scan_port_status "$p" "tcp")
         if [[ "$status" == "可用" ]]; then
-            printf "\r\033[K\t${green}[✔ %s]${plain}\n" "$p"
+            printf "[K	${green}[✔ %s]${plain}
+" "$p"
         else
-            printf "\r\033[K\t${red}[✖ %s %s]${plain}\n" "$p" "$status"
+            printf "[K	${red}[✖ %s %s]${plain}
+" "$p" "$status"
         fi
     done
 
-    echo -e "  * 443系端口 (HTTPS):"
+    echo -e "  * 443系端口 (HTTPS TCP):"
     for p in "${https_ports[@]}"; do
-        printf "\t[检测 %s ...]" "$p"
+        printf "	[检测 %s ...]" "$p"
         sleep 0.12
         status=$(scan_port_status "$p" "tcp")
         if [[ "$status" == "可用" ]]; then
-            printf "\r\033[K\t${green}[✔ %s]${plain}\n" "$p"
+            printf "[K	${green}[✔ %s]${plain}
+" "$p"
         else
-            printf "\r\033[K\t${red}[✖ %s %s]${plain}\n" "$p" "$status"
+            printf "[K	${red}[✖ %s %s]${plain}
+" "$p" "$status"
         fi
     done
+
+    echo -e "  * Hysteria 2 主端口 (UDP):"
+    local hy2_scan_port=${PORT_HY2:-8443}
+    printf "	[检测 %s ...]" "$hy2_scan_port"
+    sleep 0.12
+    status=$(scan_port_status "$hy2_scan_port" "udp")
+    if [[ "$status" == "可用" ]]; then
+        printf "[K	${green}[✔ %s]${plain}
+" "$hy2_scan_port"
+    else
+        printf "[K	${red}[✖ %s %s]${plain}
+" "$hy2_scan_port" "$status"
+    fi
 
     local udp_conflict_count=0
     if command -v ss >/dev/null 2>&1; then
         udp_conflict_count=$(ss -uln | awk '{print $5}' | awk -F: '{print $NF}' | awk '$1>=20000 && $1<=50000' | wc -l)
     fi
     if [[ "$udp_conflict_count" -eq 0 ]]; then
-        echo -e "  * 端口跳跃段 (UDP) : \n\t${green}[✔ 20000 ~ 50000] 未发现监听冲突 (共 30001 个端口)${plain}"
+        echo -e "  * 端口跳跃段 (UDP) : 
+	${green}[✔ 20000 ~ 50000] 未发现监听冲突 (共 30001 个端口)${plain}"
     else
-        echo -e "  * 端口跳跃段 (UDP) : \n\t${yellow}[⚠ 20000 ~ 50000] 检测到 ${udp_conflict_count} 个监听项${plain}"
+        echo -e "  * 端口跳跃段 (UDP) : 
+	${yellow}[⚠ 20000 ~ 50000] 检测到 ${udp_conflict_count} 个监听项${plain}"
     fi
 }
 
@@ -550,134 +568,159 @@ restore_managed_asset() {
     fi
 }
 
-probe_best_sni() {
-    info "正在从 VPS 检查 REALITY SNI 候选（TLS 1.3、证书、H2、HTTP 跳转）..."
-    local sni probe_data code redirect connect appconnect http_version verify_result ms_latency sorted choice idx reason cert_pem san_match http_ok redirect_ok i j tmp tested found
-    local -a tested_sni=() remaining_sni=() shuffled_sni=() candidates=() latencies=()
-    local probe_count=10
-
+configure_hy2_custom_cert() {
+    local set_idx=${1:-1}
+    local cert_file="${CONFIG_DIR}/certs/hy2.crt"
+    local key_file="${CONFIG_DIR}/certs/hy2.key"
+    if [[ "$set_idx" -eq 2 ]]; then
+        cert_file="${CONFIG_DIR}/certs/hy2_set2.crt"
+        key_file="${CONFIG_DIR}/certs/hy2_set2.key"
+    fi
+    echo -e "${cyan}------------------------------------------------------------${plain}"
+    echo -e "自备域名与证书配置方式："
+    echo -e "  1. 手动指定现有证书与私钥路径 (已有 .crt / .key)"
+    echo -e "  2. 使用 acme.sh 自动申请真实 SSL 证书 (需域名已解析到本机 IP)"
+    echo -e "${cyan}------------------------------------------------------------${plain}"
+    local c_choice domain path_crt path_key
+    read -rp "请输入选项 [默认: 1]: " c_choice
+    c_choice=${c_choice:-1}
+    if [[ "$c_choice" == "2" ]]; then
+        read -rp "请输入 Hysteria 2 绑定域名 (需已解析至 ${IP}): " domain
+        domain=${domain,,}
+        if ! command -v ~/.acme.sh/acme.sh >/dev/null 2>&1; then
+            info "正在安装 acme.sh 工具..."
+            curl -s https://get.acme.sh | sh -s email=tofu_admin@gmail.com >/dev/null 2>&1 || true
+        fi
+        if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
+            ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
+            ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+            info "正在通过 acme.sh 申请证书..."
+            ~/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 --force
+            ~/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
+                --key-file "$key_file" \
+                --fullchain-file "$cert_file" >/dev/null 2>&1 || true
+            chmod 600 "$key_file" "$cert_file" 2>/dev/null || true
+        fi
+        if [[ -f "$cert_file" && -f "$key_file" ]]; then
+            success "证书配置成功！"
+            if [[ "$set_idx" -eq 2 ]]; then HY2_DOMAIN_2="$domain"; else HY2_DOMAIN="$domain"; fi
+            return 0
+        fi
+        warn "acme.sh 申请失败，切换为手动填写模式。"
+    fi
+    read -rp "请输入 Hysteria 2 绑定域名 (如 hy2.example.com): " domain
+    domain=${domain,,}
     while true; do
-        remaining_sni=()
-        for sni in "${DEFAULT_SNI_LIST[@]}"; do
-            found=0
-            for tested in "${tested_sni[@]}"; do
-                [[ "$tested" == "$sni" ]] && found=1 && break
-            done
-            (( found == 0 )) && remaining_sni+=("$sni")
-        done
-        if (( ${#remaining_sni[@]} == 0 )); then
-            warn "候选域名已全部检测完毕，仍没有可用候选。"
-            candidates=(); latencies=()
-        else
-            shuffled_sni=("${remaining_sni[@]}")
-            # Fisher-Yates shuffle; each recheck draws from domains not checked in prior batches.
-            for ((i=${#shuffled_sni[@]}-1; i>0; i--)); do
-                j=$((RANDOM % (i+1)))
-                tmp=${shuffled_sni[$i]}
-                shuffled_sni[$i]=${shuffled_sni[$j]}
-                shuffled_sni[$j]=$tmp
-            done
-            candidates=(); latencies=()
-            echo -e "${cyan}========================================================================${plain}"
-            printf '%-30s %-8s %-8s %-8s %-12s %s\n' "候选域名（本轮随机抽取）" "TLS1.3" "证书" "H2" "HTTP" "结果"
-            for sni in "${shuffled_sni[@]:0:probe_count}"; do
-                tested_sni+=("$sni")
-                printf '%-30s ' "$sni"
-                # --http2 requests H2; TLS is constrained to 1.3. Do not follow redirects.
-                if ! probe_data=$(curl -sS --connect-timeout 3 --max-time 8 --tlsv1.3 --tls-max 1.3 --http2 \
-                    -o /dev/null -w '%{http_code}|%{redirect_url}|%{time_connect}|%{time_appconnect}|%{http_version}|%{ssl_verify_result}' \
-                    "https://${sni}" 2>/dev/null); then
-                    printf '%-8s %-8s %-8s %-12s %s\n' "失败" "失败" "失败" "-" "TLS/证书/HTTP 探测失败"
-                    continue
-                fi
-                IFS='|' read -r code redirect connect appconnect http_version verify_result <<< "$probe_data"
-                reason=""
-                [[ "$verify_result" == "0" ]] || reason="证书链校验失败"
-                if [[ "$http_version" != "2" ]]; then reason="${reason:+${reason}、}未协商 H2"; fi
-                if [[ "$code" =~ ^3[0-9][0-9]$ ]]; then reason="${reason:+${reason}、}HTTP ${code} 跳转至 ${redirect:-未知地址}"; fi
-                http_ok=0; [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && http_ok=1
-                redirect_ok=1; [[ "$code" =~ ^3[0-9][0-9]$ ]] && redirect_ok=0
-                cert_pem=$(timeout 8 openssl s_client -connect "${sni}:443" -servername "$sni" -tls1_3 -showcerts </dev/null 2>/dev/null \
-                    | awk 'BEGIN{n=0} /-----BEGIN CERTIFICATE-----/{n++} n==1{print} /-----END CERTIFICATE-----/&&n==1{exit}')
-                san_match=0
-                if [[ -n "$cert_pem" ]] && printf '%s\n' "$cert_pem" | openssl x509 -noout -checkhost "$sni" >/dev/null 2>&1; then
-                    san_match=1
-                else
-                    reason="${reason:+${reason}、}证书 SAN 不匹配"
-                fi
-                ms_latency=$(awk -v t="$connect" 'BEGIN {if (t ~ /^[0-9]+(\.[0-9]+)?$/) printf "%d", t*1000; else print 999999}')
-                if [[ "$verify_result" == "0" && "$http_version" == "2" && "$http_ok" == 1 && "$redirect_ok" == 1 && "$san_match" == 1 ]]; then
-                    printf '%-8s %-8s %-8s %-12s %s ms TCP / %s ms TLS\n' "通过" "匹配" "通过" "HTTP ${code:-?}" "$ms_latency" "$(awk -v t="$appconnect" 'BEGIN {printf "%d", t*1000}')"
-                    candidates+=("$sni"); latencies+=("$ms_latency")
-                else
-                    printf '%-8s %-8s %-8s %-12s %s\n' "$([[ "$verify_result" == 0 ]] && echo 通过 || echo 失败)" "$([[ "$san_match" == 1 ]] && printf '匹配' || printf '不匹配')" "$([[ "$http_version" == 2 ]] && echo 通过 || echo 失败)" "HTTP ${code:-?}" "${reason:-未满足筛选条件}"
-                fi
-            done
-        fi
-        echo -e "${cyan}========================================================================${plain}"
-
-        if (( ${#candidates[@]} > 0 )); then
-            sorted=$(for idx in "${!candidates[@]}"; do printf '%s\t%s\n' "${latencies[$idx]}" "${candidates[$idx]}"; done | sort -n)
-            mapfile -t candidates < <(printf '%s\n' "$sorted" | awk -F '\t' '{print $2}')
-            mapfile -t latencies < <(printf '%s\n' "$sorted" | awk -F '\t' '{print $1}')
-            echo "合格候选（按 TCP 建连时间排序；TLS 时间仅供参考）："
-            for idx in "${!candidates[@]}"; do printf '  %d. %-32s %s ms\n' "$((idx+1))" "${candidates[$idx]}" "${latencies[$idx]}"; done
-            echo -e "${cyan}========================================================================${plain}"
-            read -rp "选择编号，r 再随机检测其他域名，m 手动填写 [默认: 1]: " choice
-            choice=${choice:-1}
-            if [[ "$choice" == r || "$choice" == R ]]; then continue; fi
-            if [[ "$choice" == m || "$choice" == M ]]; then
-                read -rp "请输入 REALITY SNI 域名: " sni
-                if [[ "$sni" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then REALITY_SNI=${sni,,}; break; fi
-                warn "域名格式无效，请重新运行 SNI 探测。"; return 1
-            fi
-            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#candidates[@]} )); then
-                REALITY_SNI=${candidates[$((choice-1))]}; break
-            fi
-            warn "输入无效，请重新选择。"
-        else
-            warn "本轮没有候选通过全部检查。"
-            read -rp "输入 r 随机检测尚未检查的域名，m 手动填写 SNI，q 取消安装: " choice
-            case "$choice" in
-                r|R) (( ${#remaining_sni[@]} > 0 )) || warn "候选池已全部检测过，不能继续抽取。" ;;
-                m|M)
-                    read -rp "请输入 REALITY SNI 域名: " sni
-                    if [[ "$sni" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then REALITY_SNI=${sni,,}; break; fi
-                    warn "域名格式无效，请重新运行 SNI 探测。"; return 1
-                    ;;
-                q|Q) return 1 ;;
-                *) warn "请输入 r、m 或 q。" ;;
-            esac
-        fi
+        read -rp "请输入证书完整路径 (.crt/.pem): " path_crt
+        if [[ -f "$path_crt" ]]; then break; else warn "文件不存在，请重新输入"; fi
     done
+    while true; do
+        read -rp "请输入私钥完整路径 (.key): " path_key
+        if [[ -f "$path_key" ]]; then break; else warn "文件不存在，请重新输入"; fi
+    done
+    cp -f "$path_crt" "$cert_file"
+    cp -f "$path_key" "$key_file"
+    chmod 600 "$key_file" "$cert_file"
+    if [[ "$set_idx" -eq 2 ]]; then HY2_DOMAIN_2="$domain"; else HY2_DOMAIN="$domain"; fi
+    success "自备域名证书已就绪！"
+}
+
+configure_hy2_security() {
+    local set_idx=${1:-1}
+    echo -e "${cyan}------------------------------------------------------------${plain}"
+    echo -e "请选择 Hysteria 2 安全与证书模式："
+    echo -e "  1. 自签证书 + 跳过验证 (无需域名)"
+    echo -e "  2. 自签证书 + pinSHA-256 指纹锁定 (无需域名)"
+    echo -e "  3. 自备域名 + 真实 SSL 证书 (需已有域名)"
+    echo -e "${cyan}------------------------------------------------------------${plain}"
+    local h_choice
+    read -rp "请输入选项 [默认: 1]: " h_choice
+    h_choice=${h_choice:-1}
+    if [[ "$set_idx" -eq 2 ]]; then
+        HY2_MODE_2="$h_choice"
+        HY2_DOMAIN_2=""
+        HY2_PIN_SHA256_2=""
+        if [[ "$h_choice" == "2" ]]; then
+            HY2_PIN_SHA256_2="${CERT_SHA256_2:-$CERT_SHA256}"
+        elif [[ "$h_choice" == "3" ]]; then
+            configure_hy2_custom_cert 2
+        fi
+    else
+        HY2_MODE="$h_choice"
+        HY2_DOMAIN=""
+        HY2_PIN_SHA256=""
+        if [[ "$h_choice" == "2" ]]; then
+            HY2_PIN_SHA256="$CERT_SHA256"
+        elif [[ "$h_choice" == "3" ]]; then
+            configure_hy2_custom_cert 1
+        fi
+    fi
+}
+
+probe_best_sni() {
+    local choice sni
+    echo -e "${cyan}============================================================${plain}"
+    echo -e "请选择 REALITY 伪装域名 (SNI)："
+    for i in "${!DEFAULT_SNI_LIST[@]}"; do
+        printf "  %2d. %s
+" "$((i+1))" "${DEFAULT_SNI_LIST[$i]}"
+    done
+    echo -e "------------------------------------------------------------"
+    echo -e "输入序号 [1-10] 选择上方域名，直接回车默认选择第 1 个"
+    echo -e "输入 m 手动填写自定义域名"
+    echo -e "${cyan}============================================================${plain}"
+    read -rp "请输入您的选择 [默认: 1]: " choice
+    choice=${choice:-1}
+    if [[ "$choice" == "m" || "$choice" == "M" ]]; then
+        while true; do
+            read -rp "请输入 REALITY SNI 域名: " sni
+            if [[ "$sni" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
+                REALITY_SNI="${sni,,}"
+                break
+            else
+                warn "域名格式无效，请重新输入（如 itunes.apple.com）"
+            fi
+        done
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#DEFAULT_SNI_LIST[@]} )); then
+        REALITY_SNI="${DEFAULT_SNI_LIST[$((choice-1))]}"
+    else
+        warn "输入无效，已默认选择第 1 个: ${DEFAULT_SNI_LIST[0]}"
+        REALITY_SNI="${DEFAULT_SNI_LIST[0]}"
+    fi
+    TLS_SNI="${REALITY_SNI}"
     success "已选择 REALITY SNI：${REALITY_SNI}"
 }
 
 generate_credentials() {
-    info "正在配置节点 UUID..."
-    while true; do
-        echo "  1. 自动生成 UUID（推荐）"
-        echo "  2. 手动填写 UUID"
-        read -rp "请选择 [默认: 1]: " uuid_mode
-        uuid_mode=${uuid_mode:-1}
-        case "$uuid_mode" in
-            1)
-                UUID=$("${XRAY_BIN}" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
-                break
-                ;;
-            2)
-                read -rp "请输入 UUID（格式 XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX）: " user_uuid
-                if [[ "$user_uuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
-                    UUID=${user_uuid,,}
+    local mode=${1:-"custom"}
+    if [[ "$mode" == "custom" ]]; then
+        info "正在配置节点 UUID..."
+        while true; do
+            echo "  1. 自动生成 UUID（推荐）"
+            echo "  2. 手动填写 UUID"
+            read -rp "请选择 [默认: 1]: " uuid_mode
+            uuid_mode=${uuid_mode:-1}
+            case "$uuid_mode" in
+                1)
+                    UUID=$("${XRAY_BIN}" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
                     break
-                fi
-                warn "UUID 格式无效，请按标准 UUID 格式重新输入。"
-                ;;
-            *) warn "选择无效，请输入 1 或 2。" ;;
-        esac
-    done
+                    ;;
+                2)
+                    read -rp "请输入 UUID（格式 XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX）: " user_uuid
+                    if [[ "$user_uuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+                        UUID=${user_uuid,,}
+                        break
+                    fi
+                    warn "UUID 格式无效，请按标准 UUID 格式重新输入。"
+                    ;;
+                *) warn "选择无效，请输入 1 或 2。" ;;
+            esac
+        done
+    else
+        UUID=$("${XRAY_BIN}" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+    fi
+
     info "正在生成 REALITY 密钥与 TLS 证书..."
-    
     local key_pair
     key_pair=$("${XRAY_BIN}" x25519)
     REALITY_PRIVATE_KEY=$(echo "$key_pair" | grep -i "Private" | awk '{print $NF}')
@@ -685,6 +728,7 @@ generate_credentials() {
     REALITY_SHORT_ID=$(openssl rand -hex 4)
 
     info "正在生成 ECC P-256 自签名安全证书 (符合标准 SAN)..."
+    mkdir -p "${CONFIG_DIR}/certs"
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
         -keyout "${CONFIG_DIR}/certs/ecc.key" \
         -out "${CONFIG_DIR}/certs/ecc.crt" \
@@ -693,6 +737,14 @@ generate_credentials() {
     chmod 600 "${CONFIG_DIR}/certs/ecc.key" "${CONFIG_DIR}/certs/ecc.crt"
 
     CERT_SHA256=$(openssl x509 -noout -fingerprint -sha256 -in "${CONFIG_DIR}/certs/ecc.crt" | cut -d'=' -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$mode" == "custom" ]]; then
+        configure_hy2_security 1
+    else
+        HY2_MODE=1
+        HY2_DOMAIN=""
+        HY2_PIN_SHA256=""
+    fi
     success "凭证与证书生成完毕。"
 }
 
@@ -700,36 +752,209 @@ setup_iptables_port_hopping() {
     info "正在配置 Hysteria 2 端口跳跃转发规则 (${PORT_HOP_PORTS} -> ${PORT_HY2})..."
     cat > "${IPTABLES_SCRIPT}" <<'EOF'
 #!/usr/bin/env bash
+CONFIG_DIR="/etc/tofu"
+DATA_FILE="${CONFIG_DIR}/data.env"
+
 ACTION=$1
 TARGET_PORT=$2
-PORT_LIST=${3:-20000-50000}
+PORT_LIST=$3
 
-[[ -z "${TARGET_PORT}" ]] && exit 1
+apply_redirect() {
+    local tport=$1
+    local plist=$2
+    [[ -z "$tport" || -z "$plist" ]] && return 0
+    local IFS=','
+    read -ra PORTS <<< "$plist"
+    for PORT_SPEC in "${PORTS[@]}"; do
+        PORT_SPEC=${PORT_SPEC/-/:}
+        iptables -t nat -C PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$tport" 2>/dev/null || \
+            iptables -t nat -A PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$tport" || true
+        ip6tables -t nat -C PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$tport" 2>/dev/null || \
+            ip6tables -t nat -A PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$tport" 2>/dev/null || true
+    done
+}
 
-IFS=',' read -ra PORTS <<< "$PORT_LIST"
-for PORT_SPEC in "${PORTS[@]}"; do
-    PORT_SPEC=${PORT_SPEC/-/:}
-    if [[ "$ACTION" == enable ]]; then
-        iptables -t nat -C PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" 2>/dev/null || \
-            iptables -t nat -A PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" || exit 1
-        ip6tables -t nat -C PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" 2>/dev/null || \
-            ip6tables -t nat -A PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" 2>/dev/null || true
-    elif [[ "$ACTION" == disable ]]; then
-        while iptables -t nat -D PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" 2>/dev/null; do :; done
-        while ip6tables -t nat -D PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$TARGET_PORT" 2>/dev/null; do :; done
+flush_redirect() {
+    local tport=$1
+    local plist=$2
+    if [[ -n "$tport" && -n "$plist" ]]; then
+        local IFS=','
+        read -ra PORTS <<< "$plist"
+        for PORT_SPEC in "${PORTS[@]}"; do
+            PORT_SPEC=${PORT_SPEC/-/:}
+            while iptables -t nat -D PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$tport" 2>/dev/null; do :; done
+            while ip6tables -t nat -D PREROUTING -p udp --dport "$PORT_SPEC" -j REDIRECT --to-ports "$tport" 2>/dev/null; do :; done
+        done
     else
-        echo "Usage: $0 {enable|disable} <target_port> [port-list]"
-        exit 2
+        while iptables -t nat -D PREROUTING -p udp --dport 20000:50000 -j REDIRECT 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -p udp --dport 20000:35000 -j REDIRECT 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -p udp --dport 35001:50000 -j REDIRECT 2>/dev/null; do :; done
+        while ip6tables -t nat -D PREROUTING -p udp --dport 20000:50000 -j REDIRECT 2>/dev/null; do :; done
+        while ip6tables -t nat -D PREROUTING -p udp --dport 20000:35000 -j REDIRECT 2>/dev/null; do :; done
+        while ip6tables -t nat -D PREROUTING -p udp --dport 35001:50000 -j REDIRECT 2>/dev/null; do :; done
     fi
-done
+}
+
+case "$ACTION" in
+    apply)
+        if [[ -f "$DATA_FILE" ]]; then
+            source "$DATA_FILE"
+            apply_redirect "${PORT_HY2}" "${PORT_HOP_PORTS}"
+            if [[ "${NODE_SET_COUNT}" == "2" && -n "${PORT_HY2_2}" && -n "${PORT_HOP_PORTS_2}" ]]; then
+                apply_redirect "${PORT_HY2_2}" "${PORT_HOP_PORTS_2}"
+            fi
+        fi
+        ;;
+    flush)
+        if [[ -f "$DATA_FILE" ]]; then
+            source "$DATA_FILE"
+            flush_redirect "${PORT_HY2}" "${PORT_HOP_PORTS}"
+            if [[ -n "${PORT_HY2_2}" && -n "${PORT_HOP_PORTS_2}" ]]; then
+                flush_redirect "${PORT_HY2_2}" "${PORT_HOP_PORTS_2}"
+            fi
+        fi
+        flush_redirect
+        ;;
+    enable)
+        apply_redirect "$TARGET_PORT" "$PORT_LIST"
+        ;;
+    disable)
+        flush_redirect "$TARGET_PORT" "$PORT_LIST"
+        ;;
+    *)
+        echo "Usage: $0 {apply|flush|enable <port> <range>|disable <port> <range>}"
+        exit 1
+        ;;
+esac
 EOF
     chmod +x "${IPTABLES_SCRIPT}"
-    /bin/bash "${IPTABLES_SCRIPT}" enable "${PORT_HY2}" "${PORT_HOP_PORTS}"
+    /bin/bash "${IPTABLES_SCRIPT}" apply
     success "Hysteria 2 端口跳跃内核级 NAT 转发已就绪！"
 }
 
 generate_server_config() {
     info "正在合成服务端主配置文件 (${CONFIG_FILE})..."
+    local hy2_cert="${CONFIG_DIR}/certs/ecc.crt"
+    local hy2_key="${CONFIG_DIR}/certs/ecc.key"
+    if [[ "$HY2_MODE" == "3" && -f "${CONFIG_DIR}/certs/hy2.crt" && -f "${CONFIG_DIR}/certs/hy2.key" ]]; then
+        hy2_cert="${CONFIG_DIR}/certs/hy2.crt"
+        hy2_key="${CONFIG_DIR}/certs/hy2.key"
+    fi
+
+    local set2_inbounds=""
+    local xhttp_routing_inbounds='"vless-xhttp"'
+    if [[ "${NODE_SET_COUNT}" == "2" && -n "${PORT_REALITY_2}" ]]; then
+        local hy2_cert_2="${CONFIG_DIR}/certs/ecc.crt"
+        local hy2_key_2="${CONFIG_DIR}/certs/ecc.key"
+        if [[ "$HY2_MODE_2" == "3" && -f "${CONFIG_DIR}/certs/hy2_set2.crt" && -f "${CONFIG_DIR}/certs/hy2_set2.key" ]]; then
+            hy2_cert_2="${CONFIG_DIR}/certs/hy2_set2.crt"
+            hy2_key_2="${CONFIG_DIR}/certs/hy2_set2.key"
+        fi
+        xhttp_routing_inbounds='"vless-xhttp", "vless-xhttp-2"'
+        set2_inbounds=$(cat <<SET2_EOF
+,
+    {
+      "tag": "vless-reality-2",
+      "listen": "::",
+      "port": ${PORT_REALITY_2},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID_2}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${REALITY_SNI_2}:443",
+          "xver": 0,
+          "serverNames": [
+            "${REALITY_SNI_2}"
+          ],
+          "privateKey": "${REALITY_PRIVATE_KEY_2}",
+          "shortIds": [
+            "${REALITY_SHORT_ID_2}"
+          ],
+          "spiderX": "/"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
+      }
+    },
+    {
+      "tag": "hysteria2-2",
+      "listen": "::",
+      "port": ${PORT_HY2_2},
+      "protocol": "hysteria",
+      "settings": {
+        "version": 2,
+        "clients": [
+          {
+            "auth": "${UUID_2}"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": ["h3"],
+          "certificates": [
+            {
+              "certificateFile": "${hy2_cert_2}",
+              "keyFile": "${hy2_key_2}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "tag": "vless-xhttp-2",
+      "listen": "::",
+      "port": ${PORT_XHTTP_2},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID_2}"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "xhttpSettings": {
+          "path": "/xraybox2-${UUID_2}",
+          "mode": "auto"
+        },
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "${CONFIG_DIR}/certs/ecc.crt",
+              "keyFile": "${CONFIG_DIR}/certs/ecc.key"
+            }
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
+      }
+    }
+SET2_EOF
+)
+    fi
 
     cat > "${CONFIG_FILE}" <<EOF
 {
@@ -764,7 +989,8 @@ generate_server_config() {
           "privateKey": "${REALITY_PRIVATE_KEY}",
           "shortIds": [
             "${REALITY_SHORT_ID}"
-          ]
+          ],
+          "spiderX": "/"
         }
       },
       "sniffing": {
@@ -793,8 +1019,8 @@ generate_server_config() {
           "alpn": ["h3"],
           "certificates": [
             {
-              "certificateFile": "${CONFIG_DIR}/certs/ecc.crt",
-              "keyFile": "${CONFIG_DIR}/certs/ecc.key"
+              "certificateFile": "${hy2_cert}",
+              "keyFile": "${hy2_key}"
             }
           ]
         }
@@ -834,7 +1060,7 @@ generate_server_config() {
         "destOverride": ["http", "tls", "quic"],
         "routeOnly": true
       }
-    }
+    }${set2_inbounds}
   ],
   "outbounds": [
     {
@@ -863,7 +1089,7 @@ generate_server_config() {
       {
         "type": "field",
         "inboundTag": [
-          "vless-xhttp"
+          ${xhttp_routing_inbounds}
         ],
         "outboundTag": "direct"
       },
@@ -902,9 +1128,9 @@ User=root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-ExecStartPre=-/bin/bash ${IPTABLES_SCRIPT} enable ${PORT_HY2} ${PORT_HOP_PORTS}
+ExecStartPre=-/bin/bash ${IPTABLES_SCRIPT} apply
 ExecStart=${XRAY_BIN} run -config ${CONFIG_FILE}
-ExecStopPost=-/bin/bash ${IPTABLES_SCRIPT} disable ${PORT_HY2} ${PORT_HOP_PORTS}
+ExecStopPost=-/bin/bash ${IPTABLES_SCRIPT} flush
 Restart=always
 RestartSec=3s
 LimitNOFILE=65535
@@ -925,11 +1151,11 @@ pidfile="/run/tofu.pid"
 command_background="yes"
 
 start_pre() {
-    /bin/bash ${IPTABLES_SCRIPT} enable ${PORT_HY2} ${PORT_HOP_PORTS}
+    /bin/bash ${IPTABLES_SCRIPT} apply
 }
 
 stop_post() {
-    /bin/bash ${IPTABLES_SCRIPT} disable ${PORT_HY2} ${PORT_HOP_PORTS}
+    /bin/bash ${IPTABLES_SCRIPT} flush
 }
 EOF
         chmod +x "${OPENRC_FILE}"
@@ -980,6 +1206,7 @@ stop_fallback_service() {
 
 save_env_data() {
     cat > "${DATA_FILE}" <<EOF
+NODE_SET_COUNT=${NODE_SET_COUNT:-1}
 IP="${IP}"
 UUID="${UUID}"
 PORT_REALITY=${PORT_REALITY}
@@ -989,8 +1216,26 @@ PORT_HOP_PORTS="${PORT_HOP_PORTS}"
 REALITY_SNI="${REALITY_SNI}"
 TLS_SNI="${TLS_SNI}"
 REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY}"
+REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY}"
 REALITY_SHORT_ID="${REALITY_SHORT_ID}"
 CERT_SHA256="${CERT_SHA256}"
+HY2_MODE="${HY2_MODE:-1}"
+HY2_DOMAIN="${HY2_DOMAIN}"
+HY2_PIN_SHA256="${HY2_PIN_SHA256}"
+UUID_2="${UUID_2}"
+PORT_REALITY_2=${PORT_REALITY_2}
+PORT_HY2_2=${PORT_HY2_2}
+PORT_XHTTP_2=${PORT_XHTTP_2}
+PORT_HOP_PORTS_2="${PORT_HOP_PORTS_2}"
+REALITY_SNI_2="${REALITY_SNI_2}"
+TLS_SNI_2="${TLS_SNI_2}"
+REALITY_PUBLIC_KEY_2="${REALITY_PUBLIC_KEY_2}"
+REALITY_PRIVATE_KEY_2="${REALITY_PRIVATE_KEY_2}"
+REALITY_SHORT_ID_2="${REALITY_SHORT_ID_2}"
+CERT_SHA256_2="${CERT_SHA256_2}"
+HY2_MODE_2="${HY2_MODE_2:-1}"
+HY2_DOMAIN_2="${HY2_DOMAIN_2}"
+HY2_PIN_SHA256_2="${HY2_PIN_SHA256_2}"
 EOF
     chmod 600 "$DATA_FILE"
 }
@@ -1001,6 +1246,7 @@ load_env_data() {
     PORT_HY2=${PORT_HY2:-$DEFAULT_HY2_PORT}
     PORT_XHTTP=${PORT_XHTTP:-$DEFAULT_XHTTP_PORT}
     PORT_HOP_PORTS=${PORT_HOP_PORTS:-$DEFAULT_HOP_PORTS}
+    NODE_SET_COUNT=${NODE_SET_COUNT:-1}
     [[ -f "$env_file" ]] || return 0
     chmod 700 "$CONFIG_DIR" 2>/dev/null || true
     chmod 600 "$env_file" "$CONFIG_FILE" "${CONFIG_DIR}/certs/ecc.key" "$NODES_TXT" 2>/dev/null || true
@@ -1011,17 +1257,28 @@ load_env_data() {
         value=${value#\"}
         value=${value%\"}
         case "$key" in
+            NODE_SET_COUNT) [[ "$value" =~ ^[12]$ ]] && NODE_SET_COUNT=$value ;;
             IP) [[ "$value" =~ ^[A-Fa-f0-9:.]+$ ]] && IP=$value ;;
-            UUID) [[ "$value" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] && UUID=${value,,} ;;
-            PORT_REALITY|PORT_HY2|PORT_XHTTP)
+            UUID|UUID_2) [[ "$value" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] && printf -v "$key" '%s' "${value,,}" ;;
+            PORT_REALITY|PORT_HY2|PORT_XHTTP|PORT_REALITY_2|PORT_HY2_2|PORT_XHTTP_2)
                 if [[ "$value" =~ ^[0-9]{1,5}$ ]] && (( value >= 1 && value <= 65535 )); then printf -v "$key" '%s' "$value"; fi
                 ;;
-            PORT_HOP_PORTS) [[ "$value" =~ ^[0-9,-]+$ ]] && PORT_HOP_PORTS=$value ;;
-            REALITY_SNI) [[ "$value" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] && REALITY_SNI=${value,,} ;;
-            TLS_SNI) [[ "$value" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] && TLS_SNI=${value,,} ;;
-            REALITY_PUBLIC_KEY) [[ "$value" =~ ^[A-Za-z0-9_+/=-]+$ ]] && REALITY_PUBLIC_KEY=$value ;;
-            REALITY_SHORT_ID) [[ "$value" =~ ^[[:xdigit:]]{8,16}$ ]] && REALITY_SHORT_ID=$value ;;
-            CERT_SHA256) [[ "$value" =~ ^[[:xdigit:]]{64}$ ]] && CERT_SHA256=${value,,} ;;
+            PORT_HOP_PORTS|PORT_HOP_PORTS_2) [[ "$value" =~ ^[0-9,-]+$ ]] && printf -v "$key" '%s' "$value" ;;
+            REALITY_SNI|TLS_SNI|REALITY_SNI_2|TLS_SNI_2|HY2_DOMAIN|HY2_DOMAIN_2)
+                if [[ "$value" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then printf -v "$key" '%s' "${value,,}"; fi
+                ;;
+            REALITY_PUBLIC_KEY|REALITY_PUBLIC_KEY_2|REALITY_PRIVATE_KEY|REALITY_PRIVATE_KEY_2)
+                [[ "$value" =~ ^[A-Za-z0-9_+/=-]+$ ]] && printf -v "$key" '%s' "$value"
+                ;;
+            REALITY_SHORT_ID|REALITY_SHORT_ID_2)
+                [[ "$value" =~ ^[[:xdigit:]]{8,16}$ ]] && printf -v "$key" '%s' "$value"
+                ;;
+            CERT_SHA256|CERT_SHA256_2|HY2_PIN_SHA256|HY2_PIN_SHA256_2)
+                [[ "$value" =~ ^[[:xdigit:]]{64}$ ]] && printf -v "$key" '%s' "${value,,}"
+                ;;
+            HY2_MODE|HY2_MODE_2)
+                [[ "$value" =~ ^[123]$ ]] && printf -v "$key" '%s' "$value"
+                ;;
         esac
     done < "$env_file"
 }
@@ -1037,21 +1294,65 @@ generate_client_links() {
     fragment_hy2=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe="-._~"))' 'Hysteria 2-（UDP端口跳跃）')
     fragment_xhttp=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe="-._~"))' 'XHTTP-VLESS+TLS-(可套CDN+WARP)')
     LINK_REALITY="vless://${UUID}@${host_ip}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#${fragment_reality}"
-    LINK_HY2="hysteria2://${UUID}@${host_ip}:${PORT_HY2}?mport=${PORT_HOP_PORTS//,/%2C}&security=tls&alpn=h3&insecure=1&sni=${TLS_SNI}#${fragment_hy2}"
+
+    if [[ "$HY2_MODE" == "2" ]]; then
+        LINK_HY2="hysteria2://${UUID}@${host_ip}:${PORT_HY2}?mport=${PORT_HOP_PORTS//,/%2C}&security=tls&alpn=h3&insecure=1&pinSHA256=${HY2_PIN_SHA256}&sni=${TLS_SNI}#${fragment_hy2}"
+    elif [[ "$HY2_MODE" == "3" && -n "$HY2_DOMAIN" ]]; then
+        LINK_HY2="hysteria2://${UUID}@${HY2_DOMAIN}:${PORT_HY2}?mport=${PORT_HOP_PORTS//,/%2C}&security=tls&alpn=h3&sni=${HY2_DOMAIN}#${fragment_hy2}"
+    else
+        LINK_HY2="hysteria2://${UUID}@${host_ip}:${PORT_HY2}?mport=${PORT_HOP_PORTS//,/%2C}&security=tls&alpn=h3&insecure=1&sni=${TLS_SNI}#${fragment_hy2}"
+    fi
+
     LINK_XHTTP="vless://${UUID}@${host_ip}:${PORT_XHTTP}?encryption=none&security=tls&sni=${TLS_SNI}&type=xhttp&path=%2Fxraybox-${UUID}&mode=auto&pcs=${CERT_SHA256}&pinnedPeerCertSha256=${CERT_SHA256}#${fragment_xhttp}"
+
+    local set2_txt=""
+    if [[ "${NODE_SET_COUNT}" == "2" && -n "${UUID_2}" ]]; then
+        local fragment_reality_2 fragment_hy2_2 fragment_xhttp_2
+        fragment_reality_2=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe="-._~"))' 'REALITY-VLESS+XTLS-Vision-（第二套主力）')
+        fragment_hy2_2=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe="-._~"))' 'Hysteria 2-（第二套UDP跳跃）')
+        fragment_xhttp_2=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe="-._~"))' 'XHTTP-VLESS+TLS-(第二套可套CDN)')
+
+        LINK_REALITY_2="vless://${UUID_2}@${host_ip}:${PORT_REALITY_2}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI_2}&fp=chrome&pbk=${REALITY_PUBLIC_KEY_2}&sid=${REALITY_SHORT_ID_2}&type=tcp#${fragment_reality_2}"
+
+        if [[ "$HY2_MODE_2" == "2" ]]; then
+            LINK_HY2_2="hysteria2://${UUID_2}@${host_ip}:${PORT_HY2_2}?mport=${PORT_HOP_PORTS_2//,/%2C}&security=tls&alpn=h3&insecure=1&pinSHA256=${HY2_PIN_SHA256_2}&sni=${TLS_SNI_2}#${fragment_hy2_2}"
+        elif [[ "$HY2_MODE_2" == "3" && -n "$HY2_DOMAIN_2" ]]; then
+            LINK_HY2_2="hysteria2://${UUID_2}@${HY2_DOMAIN_2}:${PORT_HY2_2}?mport=${PORT_HOP_PORTS_2//,/%2C}&security=tls&alpn=h3&sni=${HY2_DOMAIN_2}#${fragment_hy2_2}"
+        else
+            LINK_HY2_2="hysteria2://${UUID_2}@${host_ip}:${PORT_HY2_2}?mport=${PORT_HOP_PORTS_2//,/%2C}&security=tls&alpn=h3&insecure=1&sni=${TLS_SNI_2}#${fragment_hy2_2}"
+        fi
+
+        LINK_XHTTP_2="vless://${UUID_2}@${host_ip}:${PORT_XHTTP_2}?encryption=none&security=tls&sni=${TLS_SNI_2}&type=xhttp&path=%2Fxraybox2-${UUID_2}&mode=auto&pcs=${CERT_SHA256_2:-$CERT_SHA256}&pinnedPeerCertSha256=${CERT_SHA256_2:-$CERT_SHA256}#${fragment_xhttp_2}"
+
+        set2_txt=$(cat <<SET2_TXT_EOF
+
+========================================================================
+【第二套节点】
+【节点2-1】REALITY-VLESS+XTLS-Vision-（第二套主力）
+${LINK_REALITY_2}
+
+【节点2-2】Hysteria 2-（第二套UDP跳跃）
+${LINK_HY2_2}
+
+【节点2-3】XHTTP-VLESS+TLS-(第二套可套CDN)
+${LINK_XHTTP_2}
+SET2_TXT_EOF
+)
+    fi
 
     cat > "${NODES_TXT}" <<EOF
 ========================================================================
                       ToFu 节点配置直连与备份
 ========================================================================
-【节点1】REALITY-VLESS+XTLS-Vision-（主力节点）
+【第 1 套节点】
+【节点1-1】REALITY-VLESS+XTLS-Vision-（主力节点）
 ${LINK_REALITY}
 
-【节点2】Hysteria 2-（UDP端口跳跃）
+【节点1-2】Hysteria 2-（UDP端口跳跃）
 ${LINK_HY2}
 
-【节点3】XHTTP-VLESS+TLS-(可套CDN+WARP)
-${LINK_XHTTP}
+【节点1-3】XHTTP-VLESS+TLS-(可套CDN+WARP)
+${LINK_XHTTP}${set2_txt}
 ========================================================================
 EOF
     chmod 600 "${NODES_TXT}"
@@ -1146,11 +1447,18 @@ show_node_info() {
 
     clear
     echo -e "${cyan}========================================================================${plain}"
-    echo -e "              ${bold}${green}🎉  ToFu 节点部署完成！${plain}"
+    if [[ "${NODE_SET_COUNT}" == "2" ]]; then
+        echo -e "              ${bold}${green}🎉  ToFu 节点部署完成 (共 2 套独立节点)！${plain}"
+    else
+        echo -e "              ${bold}${green}🎉  ToFu 节点部署完成！${plain}"
+    fi
     echo -e "${cyan}========================================================================${plain}"
     echo -e "✅ 提示：复制以下客户端链接，或回车使用二维码，导入代理工具；链接已同步写入 ${NODES_TXT}"
     echo -e "✅ 提示：Hysteria 2 节点，如果在V2rayN客户端中使用，务必将配置右上角的Core类型更改为sing-box"
     echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
+    if [[ "${NODE_SET_COUNT}" == "2" ]]; then
+        echo -e "【第 1 套节点】"
+    fi
     echo -e "${bold}${yellow}【节点1】REALITY-VLESS+XTLS-Vision-（主力节点）${plain}"
     echo -e "${cyan}${LINK_REALITY}${plain}"
     echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
@@ -1159,58 +1467,116 @@ show_node_info() {
     echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
     echo -e "${bold}${yellow}【节点3】XHTTP-VLESS+TLS-(可套CDN+WARP)${plain}"
     echo -e "${cyan}${LINK_XHTTP}${plain}"
+    if [[ "${NODE_SET_COUNT}" == "2" ]]; then
+        echo -e "${cyan}========================================================================${plain}"
+        echo -e "【第 2 套节点】"
+        echo -e "${bold}${yellow}【节点2-1】REALITY-VLESS+XTLS-Vision-（第二套主力）${plain}"
+        echo -e "${cyan}${LINK_REALITY_2}${plain}"
+        echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
+        echo -e "${bold}${yellow}【节点2-2】Hysteria 2-（第二套UDP跳跃）${plain}"
+        echo -e "${cyan}${LINK_HY2_2}${plain}"
+        echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
+        echo -e "${bold}${yellow}【节点2-3】XHTTP-VLESS+TLS-(第二套可套CDN)${plain}"
+        echo -e "${cyan}${LINK_XHTTP_2}${plain}"
+    fi
     echo -e "${cyan}========================================================================${plain}"
-    echo -e "  ${green}1.${plain} 显示所有节点二维码 (依次输出 3 个节点二维码，回车默认)"
-    echo
-    echo -e "  ${green}2.${plain} 仅显示 【节点1】VLESS + REALITY 节点二维码"
-    echo
-    echo -e "  ${green}3.${plain} 仅显示 【节点2】Hysteria 2 (带端口跳跃) 节点二维码"
-    echo
-    echo -e "  ${green}4.${plain} 仅显示 【节点3】VLESS + XHTTP 节点二维码"
-    echo
-    echo -e "  ${green}5.${plain} Cloudflare CDN + WARP 专区"
-    echo
-    echo -e "  ${green}0.${plain} 返回管理菜单"
-    echo -e "${cyan}========================================================================${plain}"
-    read -rp "请输入选项 [默认: 1]: " qr_choice
-    qr_choice=${qr_choice:-1}
-    case "$qr_choice" in
-        1)
-            show_qr "REALITY-VLESS+XTLS-Vision-（主力节点）" "${LINK_REALITY}"
-            show_qr "Hysteria 2-（UDP端口跳跃）" "${LINK_HY2}"
-            show_qr "XHTTP-VLESS+TLS-(可套CDN+WARP)" "${LINK_XHTTP}"
-            echo -e "\n按任意键返回管理菜单..."
-            read -n 1 -s -r
-            main_menu
-            ;;
-        2)
-            show_qr "REALITY-VLESS+XTLS-Vision-（主力节点）" "${LINK_REALITY}"
-            echo -e "\n按任意键返回管理菜单..."
-            read -n 1 -s -r
-            main_menu
-            ;;
-        3)
-            show_qr "Hysteria 2-（UDP端口跳跃）" "${LINK_HY2}"
-            echo -e "\n按任意键返回管理菜单..."
-            read -n 1 -s -r
-            main_menu
-            ;;
-        4)
-            show_qr "XHTTP-VLESS+TLS-(可套CDN+WARP)" "${LINK_XHTTP}"
-            echo -e "\n按任意键返回管理菜单..."
-            read -n 1 -s -r
-            main_menu
-            ;;
-        5)
-            cloudflare_cdn_menu "info"
-            ;;
-        0)
-            main_menu
-            ;;
-        *)
-            main_menu
-            ;;
-    esac
+    if [[ "${NODE_SET_COUNT}" == "2" ]]; then
+        echo -e "  ${green}1.${plain} 显示全部节点二维码 (共 6 个节点二维码，回车默认)"
+        echo
+        echo -e "  ${green}2.${plain} 仅显示【第 1 套节点】二维码"
+        echo
+        echo -e "  ${green}3.${plain} 仅显示【第 2 套节点】二维码"
+        echo
+        echo -e "  ${green}4.${plain} Cloudflare CDN + WARP 专区"
+        echo
+        echo -e "  ${green}0.${plain} 返回管理菜单"
+        echo -e "${cyan}========================================================================${plain}"
+        read -rp "请输入选项 [默认: 1]: " qr_choice
+        qr_choice=${qr_choice:-1}
+        case "$qr_choice" in
+            1)
+                show_qr "【第1套】REALITY-VLESS+XTLS-Vision" "${LINK_REALITY}"
+                show_qr "【第1套】Hysteria 2 (UDP跳跃)" "${LINK_HY2}"
+                show_qr "【第1套】XHTTP-VLESS+TLS" "${LINK_XHTTP}"
+                show_qr "【第2套】REALITY-VLESS+XTLS-Vision" "${LINK_REALITY_2}"
+                show_qr "【第2套】Hysteria 2 (UDP跳跃)" "${LINK_HY2_2}"
+                show_qr "【第2套】XHTTP-VLESS+TLS" "${LINK_XHTTP_2}"
+                echo -e "
+按任意键返回管理菜单..."
+                read -n 1 -s -r
+                main_menu
+                ;;
+            2)
+                show_qr "【第1套】REALITY-VLESS+XTLS-Vision" "${LINK_REALITY}"
+                show_qr "【第1套】Hysteria 2 (UDP跳跃)" "${LINK_HY2}"
+                show_qr "【第1套】XHTTP-VLESS+TLS" "${LINK_XHTTP}"
+                echo -e "
+按任意键返回管理菜单..."
+                read -n 1 -s -r
+                main_menu
+                ;;
+            3)
+                show_qr "【第2套】REALITY-VLESS+XTLS-Vision" "${LINK_REALITY_2}"
+                show_qr "【第2套】Hysteria 2 (UDP跳跃)" "${LINK_HY2_2}"
+                show_qr "【第2套】XHTTP-VLESS+TLS" "${LINK_XHTTP_2}"
+                echo -e "
+按任意键返回管理菜单..."
+                read -n 1 -s -r
+                main_menu
+                ;;
+            4) cloudflare_cdn_menu "info" ;;
+            *) main_menu ;;
+        esac
+    else
+        echo -e "  ${green}1.${plain} 显示所有节点二维码 (依次输出 3 个节点二维码，回车默认)"
+        echo
+        echo -e "  ${green}2.${plain} 仅显示 【节点1】VLESS + REALITY 节点二维码"
+        echo
+        echo -e "  ${green}3.${plain} 仅显示 【节点2】Hysteria 2 (带端口跳跃) 节点二维码"
+        echo
+        echo -e "  ${green}4.${plain} 仅显示 【节点3】VLESS + XHTTP 节点二维码"
+        echo
+        echo -e "  ${green}5.${plain} Cloudflare CDN + WARP 专区"
+        echo
+        echo -e "  ${green}0.${plain} 返回管理菜单"
+        echo -e "${cyan}========================================================================${plain}"
+        read -rp "请输入选项 [默认: 1]: " qr_choice
+        qr_choice=${qr_choice:-1}
+        case "$qr_choice" in
+            1)
+                show_qr "REALITY-VLESS+XTLS-Vision-（主力节点）" "${LINK_REALITY}"
+                show_qr "Hysteria 2-（UDP端口跳跃）" "${LINK_HY2}"
+                show_qr "XHTTP-VLESS+TLS-(可套CDN+WARP)" "${LINK_XHTTP}"
+                echo -e "
+按任意键返回管理菜单..."
+                read -n 1 -s -r
+                main_menu
+                ;;
+            2)
+                show_qr "REALITY-VLESS+XTLS-Vision-（主力节点）" "${LINK_REALITY}"
+                echo -e "
+按任意键返回管理菜单..."
+                read -n 1 -s -r
+                main_menu
+                ;;
+            3)
+                show_qr "Hysteria 2-（UDP端口跳跃）" "${LINK_HY2}"
+                echo -e "
+按任意键返回管理菜单..."
+                read -n 1 -s -r
+                main_menu
+                ;;
+            4)
+                show_qr "XHTTP-VLESS+TLS-(可套CDN+WARP)" "${LINK_XHTTP}"
+                echo -e "
+按任意键返回管理菜单..."
+                read -n 1 -s -r
+                main_menu
+                ;;
+            5) cloudflare_cdn_menu "info" ;;
+            *) main_menu ;;
+        esac
+    fi
 }
 
 install_all() {
@@ -1337,25 +1703,7 @@ install_all() {
             fi
         done
 
-        read -rp "请输入 REALITY 伪装域名 [回车自动智能探测最优 SNI]: " user_sni
-        if [[ -n "$user_sni" ]]; then
-            if [[ "$user_sni" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
-                REALITY_SNI="${user_sni,,}"
-            else
-                warn "域名格式无效，将重新输入。"
-                read -rp "请重新输入 REALITY 域名（留空自动探测）: " user_sni_retry
-                if [[ -z "$user_sni_retry" ]]; then
-                    probe_best_sni
-                elif [[ "$user_sni_retry" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
-                    REALITY_SNI="${user_sni_retry,,}"
-                else
-                    error "域名格式仍无效，停止安装。"
-                    return 1
-                fi
-            fi
-        else
-            probe_best_sni
-        fi
+        probe_best_sni
     else
         PORT_HOP_PORTS=$DEFAULT_HOP_PORTS
 
@@ -1378,7 +1726,10 @@ install_all() {
             PORT_XHTTP=2053
         fi
 
-        probe_best_sni
+        local top3=("itunes.apple.com" "gateway.icloud.com" "swdist.apple.com")
+        REALITY_SNI="${top3[$((RANDOM % 3))]}"
+        TLS_SNI="${REALITY_SNI}"
+        success "小白模式已随机选定 REALITY SNI：${REALITY_SNI}"
     fi
 
     TLS_SNI=${REALITY_SNI}
@@ -1388,7 +1739,8 @@ install_all() {
 
     configure_firewalls "${PORT_REALITY}" "${PORT_HY2}" "${PORT_XHTTP}" "${PORT_HOP_PORTS}"
     install_xray_core || { error "Xray 核心安装失败，停止部署。"; return 1; }
-    generate_credentials
+    if [[ "$mode_choice" == "2" ]]; then generate_credentials "custom"; else generate_credentials "auto"; fi
+    NODE_SET_COUNT=1
     setup_iptables_port_hopping
     generate_server_config
     setup_system_service
@@ -1712,7 +2064,8 @@ with open(p, "r", encoding="utf-8") as f:
 rules = cfg.setdefault("routing", {}).setdefault("rules", [])
 found = False
 for rule in rules:
-    if rule.get("inboundTag") == ["vless-xhttp"]:
+    inbound_tags = rule.get("inboundTag", [])
+    if isinstance(inbound_tags, list) and any("vless-xhttp" in t for t in inbound_tags):
         rule["outboundTag"] = "warp-socks" if enabled else "direct"
         found = True
 if not found:
@@ -1935,6 +2288,229 @@ cloudflare_cdn_menu() {
     done
 }
 
+clean_wipe_for_reinstall() {
+    info "正在停止现有服务并释放端口与转发规则..."
+    stop_service
+    pkill -9 xray >/dev/null 2>&1 || true
+    if [[ -f "${IPTABLES_SCRIPT}" ]]; then
+        /bin/bash "${IPTABLES_SCRIPT}" flush >/dev/null 2>&1 || true
+    fi
+    rm -f "${CONFIG_FILE}" "${DATA_FILE}" "${NODES_TXT}"
+    NODE_SET_COUNT=1
+    unset PORT_REALITY_2 PORT_HY2_2 PORT_XHTTP_2 PORT_HOP_PORTS_2 UUID_2 REALITY_SNI_2 TLS_SNI_2
+    unset REALITY_PUBLIC_KEY_2 REALITY_PRIVATE_KEY_2 REALITY_SHORT_ID_2 CERT_SHA256_2 HY2_MODE_2 HY2_DOMAIN_2 HY2_PIN_SHA256_2
+    success "历史服务已停止，端口与转发规则已全部释放。"
+}
+
+deploy_second_set() {
+    clear
+    show_logo
+    echo -e "${bold}${cyan}正在部署第 2 套全新节点...${plain}"
+    echo -e "${cyan}========================================================================${plain}"
+    if [[ "${PORT_HOP_PORTS}" == "20000-50000" ]]; then
+        info "正在调整第 1 套节点端口跳跃段为 20000-35000，为第 2 套预留 35001-50000..."
+        PORT_HOP_PORTS="20000-35000"
+    fi
+
+    echo -e "请选择第 2 套节点部署模式："
+    echo -e "  ${green}1.${plain} 小白模式 (自动分配端口与参数)"
+    echo -e "  ${green}2.${plain} 自定义端口与参数模式"
+    echo -e "  ${green}0.${plain} 取消返回"
+    echo -e "${cyan}------------------------------------------------------------${plain}"
+    local m_choice
+    read -rp "请输入选项 [默认: 1]: " m_choice
+    m_choice=${m_choice:-1}
+    if [[ "$m_choice" == "0" ]]; then return 0; fi
+
+    if [[ "$m_choice" == "2" ]]; then
+        while true; do
+            read -rp "请输入第 2 套 REALITY 端口 [默认: 10443]: " user_p
+            user_p=${user_p:-10443}
+            if [[ "$user_p" =~ ^[0-9]+$ ]] && (( user_p >= 1 && user_p <= 65535 )) && [[ "$user_p" != "$PORT_REALITY" && "$user_p" != "$PORT_HY2" && "$user_p" != "$PORT_XHTTP" ]]; then
+                PORT_REALITY_2=$user_p; break
+            else warn "端口无效或与第 1 套冲突，请重新输入！"; fi
+        done
+        while true; do
+            read -rp "请输入第 2 套 Hysteria 2 主端口 [默认: 18443]: " user_p
+            user_p=${user_p:-18443}
+            if [[ "$user_p" =~ ^[0-9]+$ ]] && (( user_p >= 1 && user_p <= 65535 )) && [[ "$user_p" != "$PORT_REALITY" && "$user_p" != "$PORT_HY2" && "$user_p" != "$PORT_XHTTP" && "$user_p" != "$PORT_REALITY_2" ]]; then
+                PORT_HY2_2=$user_p; break
+            else warn "端口无效或与现有端口冲突，请重新输入！"; fi
+        done
+        while true; do
+            read -rp "请输入第 2 套端口跳跃段 [默认: 35001-50000]: " user_h
+            user_h=${user_h:-"35001-50000"}
+            if [[ "$user_h" =~ ^[0-9]+-[0-9]+$ ]]; then
+                PORT_HOP_PORTS_2=$user_h; break
+            else warn "格式无效，格式示例: 35001-50000"; fi
+        done
+        while true; do
+            read -rp "请输入第 2 套 VLESS-XHTTP 端口 [默认: 12053]: " user_p
+            user_p=${user_p:-12053}
+            if [[ "$user_p" =~ ^[0-9]+$ ]] && (( user_p >= 1 && user_p <= 65535 )) && [[ "$user_p" != "$PORT_REALITY" && "$user_p" != "$PORT_HY2" && "$user_p" != "$PORT_XHTTP" && "$user_p" != "$PORT_REALITY_2" && "$user_p" != "$PORT_HY2_2" ]]; then
+                PORT_XHTTP_2=$user_p; break
+            else warn "端口无效或与现有端口冲突，请重新输入！"; fi
+        done
+        echo -e "${cyan}请选择第 2 套 REALITY 伪装域名 (SNI)：${plain}"
+        local orig_sni=$REALITY_SNI
+        probe_best_sni
+        REALITY_SNI_2=$REALITY_SNI
+        TLS_SNI_2=$REALITY_SNI_2
+        REALITY_SNI=$orig_sni
+
+        info "正在配置第 2 套 UUID..."
+        UUID_2=$("${XRAY_BIN}" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+        configure_hy2_security 2
+    else
+        PORT_REALITY_2=$(find_free_port 10443)
+        PORT_HY2_2=$(find_free_port 18443)
+        PORT_XHTTP_2=$(find_free_port 12053)
+        PORT_HOP_PORTS_2="35001-50000"
+        local top3=("gateway.icloud.com" "swdist.apple.com" "itunes.apple.com")
+        for s in "${top3[@]}"; do
+            if [[ "$s" != "$REALITY_SNI" ]]; then REALITY_SNI_2="$s"; break; fi
+        done
+        REALITY_SNI_2=${REALITY_SNI_2:-"gateway.icloud.com"}
+        TLS_SNI_2=$REALITY_SNI_2
+        UUID_2=$("${XRAY_BIN}" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+        HY2_MODE_2=1
+        HY2_DOMAIN_2=""
+        HY2_PIN_SHA256_2=""
+    fi
+
+    local key_pair_2
+    key_pair_2=$("${XRAY_BIN}" x25519)
+    REALITY_PRIVATE_KEY_2=$(echo "$key_pair_2" | grep -i "Private" | awk '{print $NF}')
+    REALITY_PUBLIC_KEY_2=$(echo "$key_pair_2" | grep -i "Public" | awk '{print $NF}')
+    REALITY_SHORT_ID_2=$(openssl rand -hex 4)
+    CERT_SHA256_2=$CERT_SHA256
+
+    NODE_SET_COUNT=2
+    info "选定第 2 套端口: REALITY: ${PORT_REALITY_2}, Hysteria 2: ${PORT_HY2_2} (跳跃: ${PORT_HOP_PORTS_2}), XHTTP: ${PORT_XHTTP_2}"
+    setup_iptables_port_hopping
+    generate_server_config
+    save_env_data
+    restart_service
+    success "第 2 套节点部署成功！"
+    show_node_info
+}
+
+reset_single_set_menu() {
+    clear
+    show_logo
+    echo -e "${cyan}========================================================================${plain}"
+    echo -e "                      ToFu 独立节点管理"
+    echo -e "${cyan}========================================================================${plain}"
+    echo -e "  ${green}1.${plain} 重置第 1 套节点"
+    echo -e "  ${green}2.${plain} 删除第 1 套节点 (保留第 2 套)"
+    echo -e "  ${green}3.${plain} 重置第 2 套节点"
+    echo -e "  ${green}4.${plain} 删除第 2 套节点 (保留第 1 套)"
+    echo -e "  ${green}0.${plain} 返回上一级"
+    echo -e "${cyan}========================================================================${plain}"
+    local sub_choice
+    read -rp "请输入操作序号 [0-4]: " sub_choice
+    case "$sub_choice" in
+        1)
+            info "正在重置第 1 套节点..."
+            install_all
+            ;;
+        2)
+            info "正在删除第 1 套节点并将第 2 套提升为主节点..."
+            UUID=$UUID_2
+            PORT_REALITY=$PORT_REALITY_2
+            PORT_HY2=$PORT_HY2_2
+            PORT_XHTTP=$PORT_XHTTP_2
+            PORT_HOP_PORTS=$PORT_HOP_PORTS_2
+            REALITY_SNI=$REALITY_SNI_2
+            TLS_SNI=$TLS_SNI_2
+            REALITY_PUBLIC_KEY=$REALITY_PUBLIC_KEY_2
+            REALITY_PRIVATE_KEY=$REALITY_PRIVATE_KEY_2
+            REALITY_SHORT_ID=$REALITY_SHORT_ID_2
+            CERT_SHA256=${CERT_SHA256_2:-$CERT_SHA256}
+            HY2_MODE=$HY2_MODE_2
+            HY2_DOMAIN=$HY2_DOMAIN_2
+            HY2_PIN_SHA256=$HY2_PIN_SHA256_2
+            NODE_SET_COUNT=1
+            unset PORT_REALITY_2 PORT_HY2_2 PORT_XHTTP_2 PORT_HOP_PORTS_2 UUID_2 REALITY_SNI_2 TLS_SNI_2
+            unset REALITY_PUBLIC_KEY_2 REALITY_PRIVATE_KEY_2 REALITY_SHORT_ID_2 CERT_SHA256_2 HY2_MODE_2 HY2_DOMAIN_2 HY2_PIN_SHA256_2
+            /bin/bash "${IPTABLES_SCRIPT}" flush >/dev/null 2>&1 || true
+            setup_iptables_port_hopping
+            generate_server_config
+            save_env_data
+            restart_service
+            success "原第 1 套已删除，现已转为单套节点运行！"
+            show_node_info
+            ;;
+        3)
+            info "正在重置第 2 套节点..."
+            deploy_second_set
+            ;;
+        4)
+            info "正在删除第 2 套节点..."
+            NODE_SET_COUNT=1
+            PORT_HOP_PORTS="20000-50000"
+            unset PORT_REALITY_2 PORT_HY2_2 PORT_XHTTP_2 PORT_HOP_PORTS_2 UUID_2 REALITY_SNI_2 TLS_SNI_2
+            unset REALITY_PUBLIC_KEY_2 REALITY_PRIVATE_KEY_2 REALITY_SHORT_ID_2 CERT_SHA256_2 HY2_MODE_2 HY2_DOMAIN_2 HY2_PIN_SHA256_2
+            /bin/bash "${IPTABLES_SCRIPT}" flush >/dev/null 2>&1 || true
+            setup_iptables_port_hopping
+            generate_server_config
+            save_env_data
+            restart_service
+            success "第 2 套节点已彻底删除！"
+            show_node_info
+            ;;
+        0) return 0 ;;
+        *) warn "无效输入"; sleep 1 ;;
+    esac
+}
+
+reinstall_or_reset_menu() {
+    load_env_data
+    if [[ ! -f "${CONFIG_FILE}" && ! -f "${DATA_FILE}" ]]; then
+        install_all
+        return 0
+    fi
+
+    clear
+    show_logo
+    echo -e "${cyan}========================================================================${plain}"
+    if [[ "${NODE_SET_COUNT}" == "2" ]]; then
+        echo -e "                   ToFu 节点重置与部署管理 (已部署 2 套节点)"
+    else
+        echo -e "                   ToFu 节点重置与部署管理"
+    fi
+    echo -e "${cyan}========================================================================${plain}"
+    echo -e "  ${green}1.${plain} 全新重置 (清空现有配置，彻底重新安装)"
+    if [[ "${NODE_SET_COUNT}" == "2" ]]; then
+        echo
+        echo -e "  ${green}2.${plain} 独立管理节点 (重置或删除第 1 套 / 第 2 套)"
+    else
+        echo
+        echo -e "  ${green}2.${plain} 额外部署一套新节点 (保留第 1 套，追加第 2 套)"
+    fi
+    echo
+    echo -e "  ${green}0.${plain} 返回主菜单"
+    echo -e "${cyan}========================================================================${plain}"
+    local r_choice
+    read -rp "请输入操作序号 [默认: 1]: " r_choice
+    r_choice=${r_choice:-1}
+    case "$r_choice" in
+        1)
+            clean_wipe_for_reinstall
+            install_all
+            ;;
+        2)
+            if [[ "${NODE_SET_COUNT}" == "2" ]]; then
+                reset_single_set_menu
+            else
+                deploy_second_set
+            fi
+            ;;
+        0) main_menu ;;
+        *) warn "无效选项，返回主菜单"; sleep 1; main_menu ;;
+    esac
+}
+
 main_menu() {
     load_env_data
     clear
@@ -1976,7 +2552,7 @@ main_menu() {
             sleep 1
             main_menu
             ;;
-        5) install_all ;;
+        5) reinstall_or_reset_menu ;;
         6)
             upgrade_xray_core
             main_menu
