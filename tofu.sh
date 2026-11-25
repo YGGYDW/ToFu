@@ -1595,6 +1595,7 @@ generate_server_config() {
           "mode": "auto"
         },
         "tlsSettings": {
+          "alpn": ["h2", "http/1.1"],
           "certificates": [
             {
               "certificateFile": "${CONFIG_DIR}/certs/ecc.crt",
@@ -1779,7 +1780,7 @@ write_sub_server_script() {
     mkdir -p "${CONFIG_DIR}"
     cat > "${SUB_SERVER_SCRIPT}" <<'EOF_PY'
 #!/usr/bin/env python3
-# ToFu Native Adaptive Subscription Server v2
+# ToFu Native Adaptive Subscription Server v3
 import os, sys, json, base64, socket, ssl, subprocess, urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -1936,7 +1937,7 @@ def generate_links(env):
     link_cdn = ""
     if cf_domain:
         frag_cdn = urllib.parse.quote('XHTTP-（CDN可换优选IP）', safe='-._~')
-        link_cdn = f'vless://{uuid}@{cf_domain}:{p_cdn}?encryption=none&security=tls&sni={cf_domain}&host={cf_domain}&type=xhttp&path=%2Fxraybox-{uuid}&mode=auto#{frag_cdn}'
+        link_cdn = f'vless://{uuid}@{cf_domain}:{p_cdn}?encryption=none&security=tls&sni={cf_domain}&host={cf_domain}&alpn=h2%2Chttp%2F1.1&fp=chrome&type=xhttp&path=%2Fxraybox-{uuid}&mode=packet-up#{frag_cdn}'
 
     return link_reality, link_hy2, link_xhttp, link_cdn
 
@@ -2020,9 +2021,14 @@ def generate_clash_yaml(env):
             '    tls: true',
             '    udp: true',
             f'    servername: {cf_domain}',
+            '    alpn:',
+            '      - h2',
+            '      - http/1.1',
+            '    client-fingerprint: chrome',
             '    xhttp-opts:',
+            f'      host: {cf_domain}',
             f'      path: /xraybox-{uuid}',
-            '      mode: auto',
+            '      mode: packet-up',
             ''
         ])
 
@@ -2159,12 +2165,15 @@ def generate_singbox_json(env):
             'uuid': uuid,
             'transport': {
                 'type': 'xhttp',
+                'host': cf_domain,
                 'path': f'/xraybox-{uuid}',
-                'mode': 'auto'
+                'mode': 'packet-up'
             },
             'tls': {
                 'enabled': True,
-                'server_name': cf_domain
+                'server_name': cf_domain,
+                'alpn': ['h2', 'http/1.1'],
+                'utls': {'enabled': True, 'fingerprint': 'chrome'}
             }
         })
 
@@ -2183,8 +2192,36 @@ def generate_singbox_json(env):
     return json.dumps(cfg, indent=2, ensure_ascii=False)
 
 class SubHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
     def log_message(self, format, *args):
         pass
+
+    def _send_text_response(self, content, content_type, disposition=None, include_sub_info=True):
+        body = content.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
+        if disposition:
+            self.send_header('Content-Disposition', disposition)
+        if include_sub_info:
+            self.send_header('Subscription-Userinfo', 'upload=0; download=0; total=0')
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        self.close_connection = True
+
+    def _send_error_close(self, code, message):
+        body = message.encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        self.close_connection = True
 
     def do_GET(self):
         env = load_env()
@@ -2192,13 +2229,13 @@ class SubHandler(BaseHTTPRequestHandler):
         enabled = env.get('SUB_ENABLED', '1')
 
         if enabled != '1' or not token:
-            self.send_error(404, 'Subscription Disabled')
+            self._send_error_close(404, 'Subscription Disabled')
             return
 
         parsed = urllib.parse.urlparse(self.path)
         expected_path = f'/sub/{token}'
         if parsed.path != expected_path:
-            self.send_error(404, 'Not Found')
+            self._send_error_close(404, 'Not Found')
             return
 
         query = urllib.parse.parse_qs(parsed.query)
@@ -2208,33 +2245,32 @@ class SubHandler(BaseHTTPRequestHandler):
         link_r, link_h, link_x, link_cdn = generate_links(env)
 
         if req_type == 'clash' or (not req_type and any(k in ua for k in ['clash', 'mihomo', 'stash', 'verge'])):
-            content = generate_clash_yaml(env)
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/yaml; charset=utf-8')
-            self.send_header('Content-Disposition', 'attachment; filename="tofu_clash.yaml"')
-            self.send_header('Subscription-Userinfo', 'upload=0; download=0; total=0')
-            self.end_headers()
-            self.wfile.write(content.encode('utf-8'))
+            self._send_text_response(
+                generate_clash_yaml(env),
+                'text/yaml; charset=utf-8',
+                disposition='attachment; filename="tofu_clash.yaml"',
+                include_sub_info=True
+            )
             return
 
         if req_type in ['singbox', 'sing-box'] or (not req_type and any(k in ua for k in ['sing-box', 'singbox', 'nekobox'])):
-            content = generate_singbox_json(env)
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Content-Disposition', 'attachment; filename="tofu_singbox.json"')
-            self.end_headers()
-            self.wfile.write(content.encode('utf-8'))
+            self._send_text_response(
+                generate_singbox_json(env),
+                'application/json; charset=utf-8',
+                disposition='attachment; filename="tofu_singbox.json"',
+                include_sub_info=False
+            )
             return
 
         all_links = f'{link_r}\n{link_h}\n{link_x}\n'
         if link_cdn:
             all_links += f'{link_cdn}\n'
         b64_data = base64.b64encode(all_links.encode('utf-8')).decode('utf-8')
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/plain; charset=utf-8')
-        self.send_header('Subscription-Userinfo', 'upload=0; download=0; total=0')
-        self.end_headers()
-        self.wfile.write(b64_data.encode('utf-8'))
+        self._send_text_response(
+            b64_data,
+            'text/plain; charset=utf-8',
+            include_sub_info=True
+        )
 
 def main():
     env = load_env()
@@ -2294,7 +2330,8 @@ def main():
                     self.RequestHandlerClass(conn, client_address, self)
                 finally:
                     try:
-                        conn.shutdown(socket.SHUT_RDWR)
+                        conn.settimeout(1.0)
+                        conn = conn.unwrap()
                     except Exception:
                         pass
                     try:
@@ -2332,7 +2369,7 @@ EOF_PY
 
 ensure_sub_server_up_to_date() {
     [[ -f "${DATA_FILE}" ]] || return 0
-    if [[ ! -f "${SUB_SERVER_SCRIPT}" ]] || ! grep -q "ToFu Native Adaptive Subscription Server v2" "${SUB_SERVER_SCRIPT}" 2>/dev/null; then
+    if [[ ! -f "${SUB_SERVER_SCRIPT}" ]] || ! grep -q "ToFu Native Adaptive Subscription Server v3" "${SUB_SERVER_SCRIPT}" 2>/dev/null; then
         write_sub_server_script
         if [[ "${SUB_ENABLED:-1}" == "1" ]]; then
             restart_sub_service
@@ -2621,7 +2658,7 @@ generate_client_links() {
     if [[ -n "$CF_CDN_DOMAIN" ]]; then
         local p_cdn="${CF_CDN_PORT:-2053}"
         local fragment_cdn="XHTTP-%EF%BC%88CDN%E5%8F%AF%E6%8D%A2%E4%BC%98%E9%80%89IP%EF%BC%89"
-        LINK_CDN="vless://${UUID}@${CF_CDN_DOMAIN}:${p_cdn}?encryption=none&security=tls&sni=${CF_CDN_DOMAIN}&host=${CF_CDN_DOMAIN}&type=xhttp&path=%2Fxraybox-${UUID}&mode=auto#${fragment_cdn}"
+        LINK_CDN="vless://${UUID}@${CF_CDN_DOMAIN}:${p_cdn}?encryption=none&security=tls&sni=${CF_CDN_DOMAIN}&host=${CF_CDN_DOMAIN}&alpn=h2%2Chttp%2F1.1&fp=chrome&type=xhttp&path=%2Fxraybox-${UUID}&mode=packet-up#${fragment_cdn}"
     fi
 
     resolve_sub_endpoint
@@ -3105,24 +3142,26 @@ show_cdn_tutorial() {
     echo -e "  2. 点击【添加记录】："
     echo -e "     - 类型 (Type)     : A"
     echo -e "     - 名称 (Name)     : ccc (自定义前缀)"
-    echo -e "     - IPv4 地址       : ${IP:-111.222.333.444} (当前服务器 IP)"
+    echo -e "     - IPv4 地址       : ${IP:-111.222.333.444} (当前服务器 IP；若无 IPv6 请勿留存失效 AAAA 记录)"
     echo -e "     - 代理状态 (Proxy): 开启【橙色云 (已代理状态)】"
     echo -e "  3. 点击保存。新添加的完整域名为：ccc.bbb.aaa.com\n"
     echo -e "${yellow}完成此步后，请按回车 [Enter] 查看步骤 2...${plain}"
     read -r
 
     echo -e "${cyan}------------------------------------------------------------------------${plain}"
-    echo -e "【步骤 2：设置 SSL/TLS 为完全加密模式】"
+    echo -e "【步骤 2：设置 SSL/TLS 为完全加密模式（关键必看！）】"
     echo -e "  1. 点击 Cloudflare 左侧菜单【SSL/TLS】➔【概述】；"
-    echo -e "  2. 将当前加密模式选择为：【完全】（Full，在部分中文面板显示为“完整”）。"
-    echo -e "     （注：此模式下 Cloudflare 会加密到您的源服务器，接受自签名证书）"
-    echo -e "     ⚠️ 切勿选择“灵活”，否则会导致重定向死循环。\n"
+    echo -e "  2. 点击【配置】，改为自定义并选择：【完全】（Full，中文面板也叫“完整”）。"
+    echo -e "     （注：源站 XHTTP 使用自签证书，选 Full 可跳过证书域名校验；"
+    echo -e "      ⚠️ 切勿选“灵活(Flexible)”，也不要保持默认“自动(Automatic)”或“完全(严格)”！）\n"
     echo -e "${yellow}完成此步后，请按回车 [Enter] 查看步骤 3...${plain}"
     read -r
 
     echo -e "${cyan}------------------------------------------------------------------------${plain}"
-    echo -e "【步骤 3：配置源服务器规则 (Origin Rules) 端口重写到 2053】"
-    echo -e "  1. 点击 Cloudflare 左侧菜单【规则】➔【概述】（或直接点击【源服务器规则 Origin Rules】）；"
+    echo -e "【步骤 3：源服务器规则 Origin Rules（仅非 ${PORT_XHTTP:-2053} 端口时需要）】"
+    echo -e "  * ${green}若您在脚本中节点 4 端口直接选了 ${PORT_XHTTP:-2053}（推荐），请直接跳过本步骤！${plain}"
+    echo -e "  * 若您选用了 443 / 2083 / 2096 等其他 Cloudflare 边缘端口，请务必配置："
+    echo -e "  1. 点击 Cloudflare 左侧菜单【规则】➔【概述】（或【Origin Rules】）；"
     echo -e "  2. 点击【创建规则】："
     echo -e "     - 规则名称: 自定义填写（如：tofu-xhttp）"
     echo -e "     - 在“当传入请求匹配时...”区域："
@@ -4304,25 +4343,17 @@ cf_inbound_cdn_menu() {
 
 render_cf_port_status() {
     local cf_ports=("443" "2053" "2083" "2087" "2096" "8443")
+    local xhttp_p="${PORT_XHTTP:-2053}"
     local status_bar=""
     local best_def=""
-    local first_avail=""
 
     for p in "${cf_ports[@]}"; do
-        local is_occ=0
-        if [[ "$p" == "$PORT_REALITY" || "$p" == "$PORT_HY2" || "$p" == "$PORT_XHTTP" || "$p" == "$SUB_PORT" ]]; then
-            is_occ=1
-        elif check_port_occupied "$p" "tcp"; then
-            is_occ=1
-        fi
-
         local item=""
-        if [[ $is_occ -eq 0 ]]; then
-            item="${green}✅${p}${plain}"
-            if [[ -z "$first_avail" ]]; then first_avail="$p"; fi
-            if [[ "$p" == "2053" ]]; then best_def="2053"; fi
+        if [[ "$p" == "$xhttp_p" ]]; then
+            item="${green}★${p}(直通)${plain}"
+            best_def="$p"
         else
-            item="${red}❌${p}${plain}"
+            item="${cyan}${p}${plain}"
         fi
 
         if [[ -z "$status_bar" ]]; then
@@ -4332,12 +4363,73 @@ render_cf_port_status() {
         fi
     done
 
-    if [[ -z "$best_def" ]]; then
-        best_def="${first_avail:-2053}"
-    fi
-
     CF_PORT_STATUS_BAR="$status_bar"
-    CF_PORT_RECOMMENDED_DEF="$best_def"
+    CF_PORT_RECOMMENDED_DEF="${best_def:-2053}"
+}
+
+prompt_cf_cdn_port() {
+    local allow_cancel=${1:-0}
+    local cur_port=${2:-""}
+    local xhttp_p="${PORT_XHTTP:-2053}"
+    local valid_cf_ports=("443" "2053" "2083" "2087" "2096" "8443")
+    CF_SELECTED_PORT=""
+
+    while true; do
+        echo -e "\n${cyan}────────────────────────────────────────────────────────────────────────${plain}"
+        render_cf_port_status
+        echo -e "Cloudflare 边缘端口池 :  ${CF_PORT_STATUS_BAR}"
+        echo -e "说明：★${xhttp_p}(直通) 与源站 XHTTP 同端口，${green}免配 Cloudflare Origin Rules${plain}；选其他端口需在 CF 设端口重写至 ${xhttp_p}。"
+        local prompt_text="请输入节点 4 代理端口 [默认: ${CF_PORT_RECOMMENDED_DEF}"
+        [[ "$allow_cancel" == "1" ]] && prompt_text="${prompt_text}, 按 0 取消"
+        prompt_text="${prompt_text}]: "
+
+        local input_port=""
+        read -rp "$prompt_text" input_port
+        input_port=${input_port:-$CF_PORT_RECOMMENDED_DEF}
+        input_port=$(echo "$input_port" | tr -d ' ')
+        if [[ "$allow_cancel" == "1" && "$input_port" == "0" ]]; then
+            return 1
+        fi
+
+        local port_valid=0
+        for p in "${valid_cf_ports[@]}"; do
+            if [[ "$p" == "$input_port" ]]; then
+                port_valid=1
+                break
+            fi
+        done
+        if [[ "$port_valid" -ne 1 ]]; then
+            warn "端口无效！Cloudflare 官方 HTTPS 代理仅支持：443、2053、2083、2087、2096、8443"
+            continue
+        fi
+
+        if [[ -n "$cur_port" && "$input_port" == "$cur_port" ]]; then
+            info "输入端口与当前节点 4 端口相同 (${cur_port})，无需修改。"
+            return 2
+        fi
+
+        if [[ "$input_port" != "$xhttp_p" ]]; then
+            warn "提示：您选择的边缘端口 (${input_port}) 与源站端口 (${xhttp_p}) 不一致，请确保已在 Cloudflare Origin Rules 中将目标端口重写为 ${xhttp_p}！"
+        fi
+
+        local confirm_port
+        while true; do
+            read -rp "确认使用 Cloudflare 边缘端口: ${input_port}？[Y/n]: " confirm_port
+            case "$confirm_port" in
+                ""|[yY]|[yY][eE][sS])
+                    CF_SELECTED_PORT="$input_port"
+                    return 0
+                    ;;
+                [nN]|[nN][oO])
+                    info "请重新输入端口..."
+                    break
+                    ;;
+                *)
+                    warn "输入无效，请按回车或输入 y 确认，或输入 n 重新输入！"
+                    ;;
+            esac
+        done
+    done
 }
 
 setup_cf_inbound_cdn() {
@@ -4381,59 +4473,10 @@ setup_cf_inbound_cdn() {
         done
     done
 
-    local input_port=""
-    local valid_cf_ports=("443" "2053" "2083" "2087" "2096" "8443")
-    while true; do
-        echo -e "\n${cyan}────────────────────────────────────────────────────────────────────────${plain}"
-        render_cf_port_status
-        echo -e "当前端口池状态 :  ${CF_PORT_STATUS_BAR}"
-        read -rp "请输入节点 4 代理端口 [默认: ${CF_PORT_RECOMMENDED_DEF}]: " input_port
-        input_port=${input_port:-$CF_PORT_RECOMMENDED_DEF}
-        input_port=$(echo "$input_port" | tr -d ' ')
-        
-        local port_valid=0
-        for p in "${valid_cf_ports[@]}"; do
-            if [[ "$p" == "$input_port" ]]; then
-                port_valid=1
-                break
-            fi
-        done
-        if [[ "$port_valid" -ne 1 ]]; then
-            warn "端口无效！Cloudflare 官方 HTTPS 代理仅支持：443、2053、2083、2087、2096、8443"
-            continue
-        fi
-
-        local is_occ=0
-        if [[ "$input_port" == "$PORT_REALITY" || "$input_port" == "$PORT_HY2" || "$input_port" == "$PORT_XHTTP" || "$input_port" == "$SUB_PORT" ]]; then
-            is_occ=1
-        elif check_port_occupied "$input_port" "tcp"; then
-            is_occ=1
-        fi
-        if [[ $is_occ -eq 1 ]]; then
-            warn "端口 ${input_port} 处于已被占用状态 (❌)，请在标有 ✅ 的可用端口中选择！"
-            continue
-        fi
-
-        local confirm_port
-        while true; do
-            read -rp "确认端口: ${input_port}？[Y/n]: " confirm_port
-            case "$confirm_port" in
-                ""|[yY]|[yY][eE][sS])
-                    break 2
-                    ;;
-                [nN]|[nN][oO])
-                    info "请重新输入端口..."
-                    break
-                    ;;
-                *)
-                    warn "输入无效，请按回车或输入 y 确认，或输入 n 重新输入！"
-                    ;;
-            esac
-        done
-    done
+    prompt_cf_cdn_port 0 "" || return 0
 
     CF_CDN_DOMAIN="$input_domain"
-    CF_CDN_PORT="$input_port"
+    CF_CDN_PORT="$CF_SELECTED_PORT"
     save_env_data
     restart_sub_service
     success "入站 CDN 节点配置完成！已新增【节点 4（XHTTP CDN 可换优选IP）】。"
@@ -5165,57 +5208,16 @@ modify_node_cdn_port() {
     echo -e "绑定 CDN 域名        : ${green}${CF_CDN_DOMAIN}${plain}"
     echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
 
-    local input_port=""
-    local valid_cf_ports=("443" "2053" "2083" "2087" "2096" "8443")
-    while true; do
-        render_cf_port_status
-        echo -e "当前端口池状态 :  ${CF_PORT_STATUS_BAR}"
-        read -rp "请输入节点 4 代理端口 [默认: ${CF_PORT_RECOMMENDED_DEF}, 按 0 取消]: " input_port
-        input_port=${input_port:-$CF_PORT_RECOMMENDED_DEF}
-        input_port=$(echo "$input_port" | tr -d ' ')
-        [[ "$input_port" == "0" ]] && { info "已取消修改。"; return 0; }
-        
-        local port_valid=0
-        for p in "${valid_cf_ports[@]}"; do
-            if [[ "$p" == "$input_port" ]]; then
-                port_valid=1
-                break
-            fi
-        done
-        if [[ "$port_valid" -ne 1 ]]; then
-            warn "端口无效！Cloudflare 官方 HTTPS 代理仅支持：443、2053、2083、2087、2096、8443"
-            continue
-        fi
+    prompt_cf_cdn_port 1 "${CF_CDN_PORT:-2053}"
+    local port_rc=$?
+    if [[ $port_rc -eq 1 ]]; then
+        info "已取消修改。"
+        return 0
+    elif [[ $port_rc -eq 2 ]]; then
+        return 0
+    fi
 
-        if [[ "$input_port" == "$CF_CDN_PORT" ]]; then
-            info "输入端口与当前节点 4 端口相同 (${CF_CDN_PORT})，无需修改。"
-            return 0
-        fi
-
-        local is_occ=0
-        if [[ "$input_port" == "$PORT_REALITY" || "$input_port" == "$PORT_HY2" || "$input_port" == "$PORT_XHTTP" || "$input_port" == "$SUB_PORT" ]]; then
-            is_occ=1
-        elif check_port_occupied "$input_port" "tcp"; then
-            is_occ=1
-        fi
-        if [[ $is_occ -eq 1 ]]; then
-            warn "端口 ${input_port} 处于已被占用状态 (❌)，请在标有 ✅ 的可用端口中选择！"
-            continue
-        fi
-        break
-    done
-
-    local confirm
-    while true; do
-        read -rp "确认将 节点 4 边缘代理端口由 ${CF_CDN_PORT:-2053} 修改为 ${input_port}？[Y/n]: " confirm
-        case "$confirm" in
-            ""|[yY]|[yY][eE][sS]) break ;;
-            [nN]|[nN][oO]) info "操作已取消。"; return 0 ;;
-            *) warn "输入无效，请按回车或输入 y 确认，或输入 n 取消！" ;;
-        esac
-    done
-
-    CF_CDN_PORT="$input_port"
+    CF_CDN_PORT="$CF_SELECTED_PORT"
     save_env_data
     generate_client_links
     restart_sub_service
