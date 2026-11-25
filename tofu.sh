@@ -38,6 +38,8 @@ DEFAULT_XHTTP_PORT=2053
 DEFAULT_HOP_PORTS="20000-50000"
 CF_CDN_DOMAIN=""
 CF_CDN_PORT=""
+SUB_DOMAIN=""
+SUB_HTTPS="auto"
 TLS_SNI=""
 ACME_PREFERRED_CA="letsencrypt"
 DEFAULT_SNI_LIST=(
@@ -755,22 +757,30 @@ issue_ssl_certificate() {
     local domain=$1
     local cert_file=$2
     local key_file=$3
+    local reload_cmd=${4:-"/usr/local/bin/tofu restart >/dev/null 2>&1 || systemctl restart tofu tofu-sub >/dev/null 2>&1 || true"}
     local acme_bin="$HOME/.acme.sh/acme.sh"
 
     [[ -x "$acme_bin" ]] || return 1
 
     local existing_cert="$HOME/.acme.sh/${domain}_ecc/fullchain.cer"
     local existing_key="$HOME/.acme.sh/${domain}_ecc/${domain}.key"
+    local ecc_flag="--ecc"
     if [[ ! -f "$existing_cert" ]]; then
         existing_cert="$HOME/.acme.sh/${domain}/fullchain.cer"
         existing_key="$HOME/.acme.sh/${domain}/${domain}.key"
+        ecc_flag=""
     fi
     if [[ -f "$existing_cert" && -f "$existing_key" ]]; then
         if openssl x509 -checkend 86400 -noout -in "$existing_cert" >/dev/null 2>&1; then
             info "检测到本地已有该域名有效证书，正在直接复用安装..."
             mkdir -p "$(dirname "$cert_file")"
-            cp -f "$existing_cert" "$cert_file"
-            cp -f "$existing_key" "$key_file"
+            if ! "$acme_bin" --install-cert -d "$domain" ${ecc_flag} \
+                --fullchain-file "$cert_file" \
+                --key-file "$key_file" \
+                --reloadcmd "$reload_cmd" >/dev/null 2>&1; then
+                cp -f "$existing_cert" "$cert_file"
+                cp -f "$existing_key" "$key_file"
+            fi
             chmod 644 "$cert_file"
             chmod 600 "$key_file"
             success "已成功复用本地有效 SSL 证书，无需重复申请！"
@@ -862,7 +872,8 @@ issue_ssl_certificate() {
     if $timeout_cmd "$acme_bin" --issue -d "$domain" --standalone -k ec-256 --server "$primary_ca" --force >"$issue_log" 2>&1; then
         "$acme_bin" --install-cert -d "$domain" --ecc \
             --fullchain-file "$cert_file" \
-            --key-file "$key_file" >/dev/null 2>&1
+            --key-file "$key_file" \
+            --reloadcmd "$reload_cmd" >/dev/null 2>&1
         rm -f "$issue_log"
         if [[ -s "$cert_file" && -s "$key_file" ]]; then
             chmod 644 "$cert_file"
@@ -883,7 +894,8 @@ issue_ssl_certificate() {
     if $timeout_cmd "$acme_bin" --issue -d "$domain" --standalone -k ec-256 --server "$backup_ca" --force >>"$issue_log" 2>&1; then
         "$acme_bin" --install-cert -d "$domain" --ecc \
             --fullchain-file "$cert_file" \
-            --key-file "$key_file" >/dev/null 2>&1
+            --key-file "$key_file" \
+            --reloadcmd "$reload_cmd" >/dev/null 2>&1
         rm -f "$issue_log"
         if [[ -s "$cert_file" && -s "$key_file" ]]; then
             chmod 644 "$cert_file"
@@ -899,6 +911,31 @@ issue_ssl_certificate() {
     echo -e "${yellow}----------------------------${plain}"
     rm -f "$issue_log"
     return 1
+}
+
+verify_domain_dns_ready() {
+    local domain="$1"
+    info "正在检测域名解析..."
+    local resolved_ip
+    resolved_ip=$(get_domain_ip "$domain")
+    if [[ -z "$resolved_ip" ]]; then
+        warn "无法解析域名 ${domain} 的 IP 地址，请确认 DNS 解析已在域名服务商处生效！"
+    elif [[ "$resolved_ip" != "$IP" ]]; then
+        warn "域名解析 IP ($resolved_ip) 与本机公网 IP ($IP) 不一致！"
+        warn "如已开启 Cloudflare 橙色云代理，请先切换为【灰云直连】后再继续。"
+    else
+        success "域名解析匹配成功！($resolved_ip)"
+        return 0
+    fi
+    local force_acme
+    while true; do
+        read -rp "是否仍要尝试继续申请？[Y/n]: " force_acme
+        case "${force_acme:-y}" in
+            [yY]|[yY][eE][sS]) return 0 ;;
+            [nN]|[nN][oO]) return 1 ;;
+            *) warn "输入无效，请输入 y 继续尝试，或输入 n 取消！" ;;
+        esac
+    done
 }
 
 prompt_for_domain() {
@@ -1112,42 +1149,7 @@ configure_hy2_custom_cert() {
                 done
                 [[ "$domain" == "0" ]] && continue
 
-                info "正在检测域名解析..."
-                local resolved_ip
-                resolved_ip=$(get_domain_ip "$domain")
-                if [[ -z "$resolved_ip" ]]; then
-                    warn "无法解析域名 ${domain} 的 IP 地址，请确认 DNS 解析已在域名服务商处生效！"
-                    local force_acme
-                    local proceed_acme=false
-                    while true; do
-                        read -rp "是否仍要尝试继续申请？[Y/n]: " force_acme
-                        case "${force_acme:-y}" in
-                            [yY]|[yY][eE][sS]) proceed_acme=true; break ;;
-                            [nN]|[nN][oO]) proceed_acme=false; break ;;
-                            *) warn "输入无效，请输入 y 继续尝试，或输入 n 取消！" ;;
-                        esac
-                    done
-                    if [[ "$proceed_acme" != true ]]; then
-                        continue
-                    fi
-                elif [[ "$resolved_ip" != "$IP" ]]; then
-                    warn "域名解析 IP ($resolved_ip) 与本机公网 IP ($IP) 不一致！"
-                    local force_acme
-                    local proceed_acme=false
-                    while true; do
-                        read -rp "是否仍要尝试继续申请？[Y/n]: " force_acme
-                        case "${force_acme:-y}" in
-                            [yY]|[yY][eE][sS]) proceed_acme=true; break ;;
-                            [nN]|[nN][oO]) proceed_acme=false; break ;;
-                            *) warn "输入无效，请输入 y 继续尝试，或输入 n 取消！" ;;
-                        esac
-                    done
-                    if [[ "$proceed_acme" != true ]]; then
-                        continue
-                    fi
-                else
-                    success "域名解析匹配成功！($resolved_ip)"
-                fi
+                verify_domain_dns_ready "$domain" || continue
 
                 install_acme || { error "acme.sh 准备失败！"; sleep 2; continue; }
                 local cert_file="${CONFIG_DIR}/certs/hy2.crt"
@@ -1774,14 +1776,111 @@ stop_fallback_service() {
 }
 
 write_sub_server_script() {
+    mkdir -p "${CONFIG_DIR}"
     cat > "${SUB_SERVER_SCRIPT}" <<'EOF_PY'
 #!/usr/bin/env python3
-# ToFu Native Adaptive Subscription Server
-import os, sys, json, base64, socket, urllib.parse
+# ToFu Native Adaptive Subscription Server v2
+import os, sys, json, base64, socket, ssl, subprocess, urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 DATA_FILE = os.environ.get('TOFU_DATA_FILE', '/etc/tofu/node_info.env')
+
+def _check_openssl_cert(cert_file, domain, require_trusted):
+    try:
+        chk_exp = subprocess.run(
+            ['openssl', 'x509', '-in', cert_file, '-noout', '-checkend', '0'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5
+        )
+        if chk_exp.returncode != 0:
+            return False, 'expired'
+    except Exception:
+        pass
+
+    if require_trusted:
+        try:
+            chk_id = subprocess.run(
+                ['openssl', 'x509', '-in', cert_file, '-noout', '-subject', '-issuer'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, universal_newlines=True
+            )
+            if chk_id.returncode == 0:
+                subj = ''
+                iss = ''
+                for line in chk_id.stdout.splitlines():
+                    if line.startswith('subject='):
+                        subj = line[len('subject='):].strip()
+                    elif line.startswith('issuer='):
+                        iss = line[len('issuer='):].strip()
+                if subj and iss and subj == iss:
+                    return False, 'self_signed'
+        except Exception:
+            pass
+
+        try:
+            chk_host = subprocess.run(
+                ['openssl', 'x509', '-in', cert_file, '-noout', '-checkhost', domain],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, universal_newlines=True
+            )
+            if chk_host.returncode != 0:
+                err_out = (chk_host.stdout + chk_host.stderr).lower()
+                if 'unknown option' not in err_out and 'unrecognized' not in err_out:
+                    return False, 'domain_mismatch'
+        except Exception:
+            pass
+
+    return True, 'ok'
+
+def resolve_tls_config(env):
+    config_dir = os.path.dirname(DATA_FILE) or '/etc/tofu'
+    certs_dir = os.path.join(config_dir, 'certs')
+    sub_https = env.get('SUB_HTTPS', 'auto').strip().lower()
+    if sub_https == '0':
+        return {'enabled': False, 'domain': '', 'cert': '', 'key': '', 'source': '', 'reason': 'disabled'}
+
+    sub_domain = env.get('SUB_DOMAIN', '').strip()
+    hy2_mode = env.get('HY2_MODE', '1').strip()
+    hy2_domain = env.get('HY2_DOMAIN', '').strip()
+
+    sub_crt = os.path.join(certs_dir, 'sub.crt')
+    sub_key = os.path.join(certs_dir, 'sub.key')
+    hy2_crt = os.path.join(certs_dir, 'hy2.crt')
+    hy2_key = os.path.join(certs_dir, 'hy2.key')
+
+    domain = ''
+    cert_file = ''
+    key_file = ''
+    source = ''
+
+    if sub_domain and os.path.isfile(sub_crt) and os.path.isfile(sub_key):
+        domain, cert_file, key_file, source = sub_domain, sub_crt, sub_key, 'sub'
+    elif hy2_mode == '2' and hy2_domain and os.path.isfile(hy2_crt) and os.path.isfile(hy2_key):
+        domain, cert_file, key_file, source = hy2_domain, hy2_crt, hy2_key, 'hy2'
+    elif sub_domain:
+        return {'enabled': False, 'domain': sub_domain, 'cert': sub_crt, 'key': sub_key, 'source': 'sub', 'reason': 'cert_missing'}
+    else:
+        return {'enabled': False, 'domain': '', 'cert': '', 'key': '', 'source': '', 'reason': 'no_domain'}
+
+    try:
+        if os.path.getsize(cert_file) <= 0 or os.path.getsize(key_file) <= 0:
+            return {'enabled': False, 'domain': domain, 'cert': cert_file, 'key': key_file, 'source': source, 'reason': 'cert_empty'}
+    except OSError:
+        return {'enabled': False, 'domain': domain, 'cert': cert_file, 'key': key_file, 'source': source, 'reason': 'cert_missing'}
+
+    try:
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        except AttributeError:
+            ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    except Exception:
+        return {'enabled': False, 'domain': domain, 'cert': cert_file, 'key': key_file, 'source': source, 'reason': 'cert_invalid'}
+
+    require_trusted = (sub_https != '1')
+    ok, reason = _check_openssl_cert(cert_file, domain, require_trusted)
+    if not ok:
+        return {'enabled': False, 'domain': domain, 'cert': cert_file, 'key': key_file, 'source': source, 'reason': reason}
+
+    return {'enabled': True, 'domain': domain, 'cert': cert_file, 'key': key_file, 'source': source, 'reason': 'ok'}
 
 def load_env():
     env = {}
@@ -2139,10 +2238,74 @@ class SubHandler(BaseHTTPRequestHandler):
 
 def main():
     env = load_env()
+    if '--print-url' in sys.argv:
+        ip = env.get('IP', '127.0.0.1')
+        host_ip = f'[{ip}]' if ':' in ip else ip
+        port = env.get('SUB_PORT', '54328')
+        token = env.get('SUB_TOKEN', '')
+        tls = resolve_tls_config(env)
+        proto = 'https' if tls['enabled'] else 'http'
+        host = tls['domain'] if tls['enabled'] else host_ip
+        url = f'{proto}://{host}:{port}/sub/{token}'
+        print(json.dumps({
+            'proto': proto,
+            'host': host,
+            'port': port,
+            'url': url,
+            'enabled': tls['enabled'],
+            'domain': tls['domain'],
+            'source': tls['source'],
+            'reason': tls['reason'],
+        }, ensure_ascii=False))
+        return
+
     port = int(env.get('SUB_PORT', '54328'))
+    tls = resolve_tls_config(env)
+    ssl_ctx = None
+    if tls['enabled']:
+        try:
+            try:
+                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            except AttributeError:
+                ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            try:
+                ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            except Exception:
+                pass
+            ssl_ctx.load_cert_chain(certfile=tls['cert'], keyfile=tls['key'])
+        except Exception:
+            ssl_ctx = None
+
+    class ToFuSubMixin(ThreadingMixIn):
+        daemon_threads = True
+        def handle_error(self, request, client_address):
+            pass
+        def finish_request(self, request, client_address):
+            try:
+                request.settimeout(10.0)
+            except Exception:
+                pass
+            if ssl_ctx is not None:
+                try:
+                    conn = ssl_ctx.wrap_socket(request, server_side=True)
+                except Exception:
+                    return
+                try:
+                    self.RequestHandlerClass(conn, client_address, self)
+                finally:
+                    try:
+                        conn.shutdown(socket.SHUT_RDWR)
+                    except Exception:
+                        pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            else:
+                super().finish_request(request, client_address)
+
     try:
-        class DualStackServer(ThreadingMixIn, HTTPServer):
-            daemon_threads = True
+        class DualStackServer(ToFuSubMixin, HTTPServer):
             address_family = socket.AF_INET6
             def server_bind(self):
                 try:
@@ -2152,8 +2315,8 @@ def main():
                 super().server_bind()
         server = DualStackServer(('::', port), SubHandler)
     except Exception:
-        class FallbackThreadedServer(ThreadingMixIn, HTTPServer):
-            daemon_threads = True
+        class FallbackThreadedServer(ToFuSubMixin, HTTPServer):
+            pass
         server = FallbackThreadedServer(('0.0.0.0', port), SubHandler)
     try:
         server.serve_forever()
@@ -2165,6 +2328,59 @@ if __name__ == '__main__':
     main()
 EOF_PY
     chmod 700 "${SUB_SERVER_SCRIPT}"
+}
+
+ensure_sub_server_up_to_date() {
+    [[ -f "${DATA_FILE}" ]] || return 0
+    if [[ ! -f "${SUB_SERVER_SCRIPT}" ]] || ! grep -q "ToFu Native Adaptive Subscription Server v2" "${SUB_SERVER_SCRIPT}" 2>/dev/null; then
+        write_sub_server_script
+        if [[ "${SUB_ENABLED:-1}" == "1" ]]; then
+            restart_sub_service
+        fi
+        if [[ -f "${NODES_TXT}" && -n "${UUID:-}" ]]; then
+            generate_client_links >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+resolve_sub_endpoint() {
+    local host_ip="${IP}"
+    if [[ "${IP}" =~ : ]]; then
+        host_ip="[${IP}]"
+    fi
+    SUB_RESOLVED_PROTO="http"
+    SUB_RESOLVED_HOST="${host_ip}"
+    SUB_RESOLVED_URL="http://${host_ip}:${SUB_PORT:-54328}/sub/${SUB_TOKEN}"
+    SUB_RESOLVED_DOMAIN=""
+    SUB_RESOLVED_SOURCE=""
+    SUB_RESOLVED_REASON="no_domain"
+
+    ensure_sub_server_up_to_date
+
+    if [[ -f "${SUB_SERVER_SCRIPT}" ]]; then
+        local py_out
+        py_out=$(TOFU_DATA_FILE="${DATA_FILE}" python3 -c "
+import subprocess, json, sys
+out = subprocess.check_output([sys.executable, sys.argv[1], '--print-url'], universal_newlines=True)
+d = json.loads(out)
+print(d.get('proto', 'http'))
+print(d.get('host', ''))
+print(d.get('url', ''))
+print(d.get('domain', ''))
+print(d.get('source', ''))
+print(d.get('reason', 'no_domain'))
+" "${SUB_SERVER_SCRIPT}" 2>/dev/null)
+        if [[ -n "$py_out" ]]; then
+            local -a parts
+            mapfile -t parts <<< "$py_out"
+            [[ -n "${parts[0]}" ]] && SUB_RESOLVED_PROTO="${parts[0]}"
+            [[ -n "${parts[1]}" ]] && SUB_RESOLVED_HOST="${parts[1]}"
+            [[ -n "${parts[2]}" ]] && SUB_RESOLVED_URL="${parts[2]}"
+            SUB_RESOLVED_DOMAIN="${parts[3]}"
+            SUB_RESOLVED_SOURCE="${parts[4]}"
+            [[ -n "${parts[5]}" ]] && SUB_RESOLVED_REASON="${parts[5]}"
+        fi
+    fi
 }
 
 setup_sub_system_service() {
@@ -2295,6 +2511,8 @@ HY2_PIN_SHA256="${HY2_PIN_SHA256}"
 SUB_PORT=${SUB_PORT:-54328}
 SUB_TOKEN="${SUB_TOKEN}"
 SUB_ENABLED=${SUB_ENABLED:-1}
+SUB_DOMAIN="${SUB_DOMAIN}"
+SUB_HTTPS="${SUB_HTTPS:-auto}"
 CF_CDN_DOMAIN="${CF_CDN_DOMAIN}"
 CF_CDN_PORT="${CF_CDN_PORT}"
 ACME_EMAIL="${ACME_EMAIL:-}"
@@ -2312,13 +2530,15 @@ load_env_data() {
     SUB_PORT=${SUB_PORT:-}
     SUB_TOKEN=${SUB_TOKEN:-}
     SUB_ENABLED=${SUB_ENABLED:-1}
+    SUB_DOMAIN=${SUB_DOMAIN:-}
+    SUB_HTTPS=${SUB_HTTPS:-auto}
     CF_CDN_DOMAIN=${CF_CDN_DOMAIN:-}
     CF_CDN_PORT=${CF_CDN_PORT:-}
     ACME_EMAIL=${ACME_EMAIL:-}
     ACME_PREFERRED_CA=${ACME_PREFERRED_CA:-letsencrypt}
     [[ -f "$env_file" ]] || return 0
     chmod 700 "$CONFIG_DIR" 2>/dev/null || true
-    chmod 600 "$env_file" "$CONFIG_FILE" "${CONFIG_DIR}/certs/ecc.key" "$NODES_TXT" 2>/dev/null || true
+    chmod 600 "$env_file" "$CONFIG_FILE" "${CONFIG_DIR}/certs/ecc.key" "${CONFIG_DIR}/certs/hy2.key" "${CONFIG_DIR}/certs/sub.key" "$NODES_TXT" 2>/dev/null || true
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" == *=* ]] || continue
         key=${line%%=*}
@@ -2353,7 +2573,10 @@ load_env_data() {
             SUB_ENABLED)
                 [[ "$value" =~ ^[01]$ ]] && printf -v "$key" '%s' "$value"
                 ;;
-            CF_CDN_DOMAIN)
+            SUB_HTTPS)
+                [[ "$value" =~ ^(auto|0|1)$ ]] && printf -v "$key" '%s' "$value"
+                ;;
+            SUB_DOMAIN|CF_CDN_DOMAIN)
                 if [[ "$value" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then printf -v "$key" '%s' "${value,,}"; fi
                 ;;
             CF_CDN_PORT)
@@ -2401,7 +2624,8 @@ generate_client_links() {
         LINK_CDN="vless://${UUID}@${CF_CDN_DOMAIN}:${p_cdn}?encryption=none&security=tls&sni=${CF_CDN_DOMAIN}&host=${CF_CDN_DOMAIN}&type=xhttp&path=%2Fxraybox-${UUID}&mode=auto#${fragment_cdn}"
     fi
 
-    local sub_url="http://${host_ip}:${SUB_PORT:-54328}/sub/${SUB_TOKEN}"
+    resolve_sub_endpoint
+    local sub_url="${SUB_RESOLVED_URL}"
     cat > "${NODES_TXT}" <<EOF
 ========================================================================
                       ToFu 节点配置直连与备份
@@ -2429,6 +2653,18 @@ EOF
     chmod 600 "${NODES_TXT}"
 }
 
+format_sub_fallback_reason() {
+    local reason="$1"
+    case "$reason" in
+        disabled) echo "用户已手动强制切换为 HTTP 模式" ;;
+        self_signed) echo "检测到自签证书，为避免客户端订阅报错，已自动回退 HTTP（可在菜单 3 强制开启）" ;;
+        domain_mismatch) echo "当前证书绑定的域名与目标域名不匹配，已自动回退 HTTP" ;;
+        expired) echo "当前域名证书已过期，已自动回退 HTTP，请及时续期或重新签发" ;;
+        cert_invalid|cert_empty|cert_missing) echo "证书文件异常或缺失，已自动回退 HTTP" ;;
+        *) echo "纯 IP 免域名运行" ;;
+    esac
+}
+
 show_node_info() {
     load_env_data
     if [[ ! -f "${CONFIG_FILE}" || ! -f "${DATA_FILE}" ]]; then
@@ -2438,11 +2674,7 @@ show_node_info() {
 
     generate_client_links
 
-    local host_ip="${IP}"
-    if [[ "${IP}" =~ : ]]; then
-        host_ip="[${IP}]"
-    fi
-    local sub_url="http://${host_ip}:${SUB_PORT}/sub/${SUB_TOKEN}"
+    local sub_url="${SUB_RESOLVED_URL}"
 
     clear
     show_logo
@@ -2453,8 +2685,15 @@ show_node_info() {
     fi
     echo -e "                         ${bold}${yellow}ToFu 节点订阅信息${plain}"
     echo -e "${cyan}========================================================================${plain}"
-    echo -e "【全平台通用订阅链接】(一键导入全部节点，自动适配各客户端格式)\n"
+    if [[ "$SUB_RESOLVED_PROTO" == "https" ]]; then
+        echo -e "【全平台通用订阅链接】${green}[🔒 HTTPS 加密 · 域名: ${SUB_RESOLVED_DOMAIN}]${plain}\n"
+    else
+        echo -e "【全平台通用订阅链接】(一键导入全部节点，自动适配各客户端格式)\n"
+    fi
     echo -e "  ${bold}${green}${sub_url}${plain}\n"
+    if [[ "$SUB_RESOLVED_PROTO" != "https" && "$SUB_RESOLVED_REASON" != "no_domain" && "$SUB_RESOLVED_REASON" != "disabled" ]]; then
+        echo -e "  ${yellow}⚠️ HTTPS 未启用原因: $(format_sub_fallback_reason "$SUB_RESOLVED_REASON")${plain}\n"
+    fi
     echo -e "【各系统推荐客户端】"
     echo -e "  ├─ Windows : v2rayN、Clash Verge Rev、Karing"
     echo -e "  ├─ macOS   : Clash Verge Rev、Karing"
@@ -2520,15 +2759,120 @@ show_node_info() {
     done
 }
 
+configure_sub_https_menu() {
+    while true; do
+        load_env_data
+        resolve_sub_endpoint
+        clear
+        show_logo
+        echo -e "${cyan}========================================================================${plain}"
+        echo -e "                    ${bold}${yellow}ToFu 订阅 HTTPS 与域名证书设置${plain}"
+        echo -e "${cyan}========================================================================${plain}"
+        if [[ "$SUB_RESOLVED_PROTO" == "https" ]]; then
+            local src_desc="专用订阅证书"
+            [[ "$SUB_RESOLVED_SOURCE" == "hy2" ]] && src_desc="自动联动节点 2 (Hy2) 域名证书"
+            echo -e "  当前协议状态 : ${green}● HTTPS 已启用 (TLS 加密)${plain}"
+            echo -e "  当前证书域名 : ${cyan}${SUB_RESOLVED_DOMAIN}${plain} (${src_desc})"
+        else
+            echo -e "  当前协议状态 : ${yellow}○ HTTP 基础模式${plain} ($(format_sub_fallback_reason "$SUB_RESOLVED_REASON"))"
+        fi
+        echo -e "  专用订阅域名 : ${cyan}${SUB_DOMAIN:-未单独绑定}${plain}"
+        if [[ "$HY2_MODE" == "2" && -n "$HY2_DOMAIN" ]]; then
+            echo -e "  节点 2 域名  : ${green}${HY2_DOMAIN}${plain} (支持自动联动)"
+        else
+            echo -e "  节点 2 域名  : ${yellow}未开启自备域名模式${plain}"
+        fi
+        local mode_desc="自动识别公信证书升级 HTTPS (推荐)"
+        [[ "${SUB_HTTPS:-auto}" == "1" ]] && mode_desc="强制启用 HTTPS (允许自签/自定义证书)"
+        [[ "${SUB_HTTPS:-auto}" == "0" ]] && mode_desc="强制使用 HTTP 基础模式"
+        echo -e "  当前策略模式 : ${cyan}${mode_desc}${plain}"
+        echo -e "${cyan}────────────────────────────────────────────────────────────────────────${plain}"
+        echo
+        echo -e "    ${green}1.${plain} 为订阅绑定独立域名并申请 ACME 免费 HTTPS 证书"
+        echo -e "        (需确保子域名已解析至本机 IP 且未开启 Cloudflare 橙色云)"
+        echo
+        echo -e "    ${green}2.${plain} 恢复自动联动模式 (解绑专用域名，自动复用节点 2 域名证书)"
+        echo
+        echo -e "    ${green}3.${plain} 切换传输协议策略 (自动 / 强制 HTTPS / 强制 HTTP)"
+        echo
+        echo -e "    ${green}0.${plain} 返回上级菜单"
+        echo -e "${cyan}========================================================================${plain}"
+        read -rp "请输入操作序号 [0-3]: " tls_opt
+        case "$tls_opt" in
+            1)
+                local domain
+                domain=$(prompt_for_domain "请输入已解析到本 VPS 的订阅域名 (如 sub.example.com，输入 0 返回): ")
+                [[ "$domain" == "0" ]] && continue
+                verify_domain_dns_ready "$domain" || continue
+                install_acme || { error "acme.sh 准备失败！"; sleep 2; continue; }
+                local cert_file="${CONFIG_DIR}/certs/sub.crt"
+                local key_file="${CONFIG_DIR}/certs/sub.key"
+                local sub_reload="systemctl restart tofu-sub >/dev/null 2>&1 || /usr/local/bin/tofu restart >/dev/null 2>&1 || true"
+                if issue_ssl_certificate "$domain" "$cert_file" "$key_file" "$sub_reload"; then
+                    SUB_DOMAIN="$domain"
+                    SUB_HTTPS="auto"
+                    save_env_data
+                    ensure_sub_server_up_to_date
+                    restart_sub_service
+                    generate_client_links
+                    success "订阅专属 HTTPS 证书已部署完成！当前地址: ${SUB_RESOLVED_URL}"
+                    echo -e "\n按任意键继续..."
+                    read -n 1 -s -r
+                else
+                    warn "证书申请失败，订阅服务保持原状态不变。"
+                    echo -e "\n按任意键返回..."
+                    read -n 1 -s -r
+                fi
+                ;;
+            2)
+                SUB_DOMAIN=""
+                SUB_HTTPS="auto"
+                rm -f "${CONFIG_DIR}/certs/sub.crt" "${CONFIG_DIR}/certs/sub.key"
+                save_env_data
+                restart_sub_service
+                generate_client_links
+                success "已恢复自动联动模式！当前地址: ${SUB_RESOLVED_URL}"
+                sleep 1.5
+                ;;
+            3)
+                echo -e "\n请选择传输协议策略："
+                echo -e "  ${green}1.${plain} 自动识别公信证书升级 HTTPS (推荐，最兼容)"
+                echo -e "  ${green}2.${plain} 强制启用 HTTPS (即使使用手动导入的自签证书也开启)"
+                echo -e "  ${green}3.${plain} 强制降级使用 HTTP 基础模式"
+                echo -e "  ${green}0.${plain} 取消"
+                local m_opt
+                read -rp "请输入选项 [0-3]: " m_opt
+                case "$m_opt" in
+                    1) SUB_HTTPS="auto" ;;
+                    2) SUB_HTTPS="1" ;;
+                    3) SUB_HTTPS="0" ;;
+                    0) continue ;;
+                    *) warn "输入无效！"; sleep 1; continue ;;
+                esac
+                save_env_data
+                ensure_sub_server_up_to_date
+                restart_sub_service
+                generate_client_links
+                success "策略已更新！当前地址: ${SUB_RESOLVED_URL}"
+                sleep 1.5
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                warn "输入错误，请输入 0-3 之间的序号！"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 subscription_management_menu() {
     load_env_data
-    local host_ip="${IP}"
-    if [[ "${IP}" =~ : ]]; then
-        host_ip="[${IP}]"
-    fi
 
     while true; do
-        local sub_base="http://${host_ip}:${SUB_PORT}/sub/${SUB_TOKEN}"
+        resolve_sub_endpoint
+        local sub_base="${SUB_RESOLVED_URL}"
         local is_run="未运行"
         local status_color="${red}"
         if is_sub_service_running; then
@@ -2542,6 +2886,11 @@ subscription_management_menu() {
         echo -e "                         ${bold}${yellow}ToFu 订阅管理设置${plain}"
         echo -e "${cyan}========================================================================${plain}"
         echo -e "  当前订阅状态 : ${status_color}● ${is_run}${plain}"
+        if [[ "$SUB_RESOLVED_PROTO" == "https" ]]; then
+            echo -e "  当前传输协议 : ${green}🔒 HTTPS 加密 (域名: ${SUB_RESOLVED_DOMAIN})${plain}"
+        else
+            echo -e "  当前传输协议 : ${yellow}○ HTTP 基础模式${plain} ($(format_sub_fallback_reason "$SUB_RESOLVED_REASON"))"
+        fi
         echo -e "  当前监听端口 : ${cyan}${SUB_PORT}${plain}"
         local masked_token="${SUB_TOKEN}"
         if [[ ${#SUB_TOKEN} -ge 8 ]]; then
@@ -2561,18 +2910,22 @@ subscription_management_menu() {
         [[ "$SUB_ENABLED" != "1" ]] && toggle_action="开启"
         echo -e "    ${green}3.${plain} ${toggle_action}订阅服务"
         echo
+        echo -e "    ${green}4.${plain} 订阅 HTTPS 与域名证书设置"
+        echo -e "        (有域名证书自动升级 HTTPS，支持绑定专用域名或切换 HTTP)"
+        echo
         echo -e "    ${green}0.${plain} 返回上级菜单"
         echo -e "${cyan}========================================================================${plain}"
-        read -rp "请输入操作序号 [0-3]: " sub_opt
+        read -rp "请输入操作序号 [0-4]: " sub_opt
         case "$sub_opt" in
             1) reset_sub_token ;;
             2) change_sub_port ;;
             3) toggle_sub_service ;;
+            4) configure_sub_https_menu ;;
             0)
                 return 0
                 ;;
             *)
-                warn "输入错误，请输入 0-3 之间的操作序号！"
+                warn "输入错误，请输入 0-4 之间的操作序号！"
                 sleep 1
                 ;;
         esac
@@ -2935,6 +3288,8 @@ install_all() {
     SUB_PORT=$(find_free_sub_port)
     SUB_TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(16))" 2>/dev/null || od -vN 16 -An -tx1 /dev/urandom | tr -d ' \n')
     SUB_ENABLED=1
+    SUB_DOMAIN="${SUB_DOMAIN:-}"
+    SUB_HTTPS="${SUB_HTTPS:-auto}"
 
     echo -e "\n${cyan}========================================================================${plain}"
     info "选定端口: REALITY: ${PORT_REALITY}, Hysteria2 主端口: ${PORT_HY2}，跳跃端口: ${PORT_HOP_PORTS}, XHTTP: ${PORT_XHTTP}, 订阅: ${SUB_PORT}"
@@ -3149,6 +3504,7 @@ uninstall_all() {
 }
 
 start_service() {
+    [[ -f "${DATA_FILE}" ]] && load_env_data
     info "正在启动 ToFu 服务..."
     local start_ok=false
     if [[ -d /run/systemd/system ]] || pidof systemd >/dev/null 2>&1; then
@@ -3176,6 +3532,7 @@ start_service() {
 }
 
 stop_service() {
+    [[ -f "${DATA_FILE}" ]] && load_env_data
     info "正在停止 ToFu 服务..."
     if [[ -d /run/systemd/system ]] || pidof systemd >/dev/null 2>&1; then
         systemctl stop tofu >/dev/null 2>&1
@@ -3188,6 +3545,7 @@ stop_service() {
 }
 
 restart_service() {
+    [[ -f "${DATA_FILE}" ]] && load_env_data
     info "正在重启 ToFu 服务..."
     if [[ -d /run/systemd/system ]] || pidof systemd >/dev/null 2>&1; then
         if systemctl restart tofu; then
@@ -3330,11 +3688,11 @@ show_domain_notice() {
     echo
     echo -e "【域名适用范围】"
     echo -e "  ├─ 域名层级 : 一级主域名 (aaa.com)、二级 (bbb.aaa.com)、三级子域名均可使用"
-    echo -e "  ├─ 节点 2 (Hy2)   : 用于申请 SSL 证书"
+    echo -e "  ├─ 节点 2 (Hy2)   : 用于申请 SSL 证书（同时会自动复用升级 HTTPS 订阅链接）"
     echo -e "  └─ 节点 3 (XHTTP) : 用于配置 Cloudflare CDN 代理"
     echo
     echo -e "【核心注意事项】"
-    echo -e "  ├─ 节点 2 (Hy2)   : 走纯 UDP 协议 ➔ 需【关闭橙色云】"
+    echo -e "  ├─ 节点 2 (Hy2)   : 走纯 UDP 协议，且自动联动高位端口 HTTPS 订阅 ➔ 需【关闭橙色云】"
     echo -e "  ├─ 节点 3 (XHTTP) : 走标准 TCP 协议，套 CDN ➔ 需【开启橙色云】"
     echo -e "  └─ 核心原则       : 同一域名的云朵不能又开又关，共用主域名时必须使用【不同子域名】！"
     echo
@@ -3521,6 +3879,9 @@ show_dashboard_panel() {
         grep -qE "[: ]${p_hy2} " <<< "$ss_uln" && p_hy2_listen=1
         grep -qE "[: ]${p_xhttp} " <<< "$ss_tln" && p_xhttp_listen=1
     fi
+    resolve_sub_endpoint
+    local sub_proto="${SUB_RESOLVED_PROTO:-http}"
+    ss_tln=$(ss -tln 2>/dev/null)
     if is_sub_service_running; then
         p_sub_listen=1
     fi
@@ -3551,7 +3912,7 @@ show_dashboard_panel() {
         "$p_reality" "$p_reality_listen" "$p_reality_proc" \
         "$p_hy2" "$p_hy2_listen" "$p_hy2_proc" "$p_hop" \
         "$p_xhttp" "$p_xhttp_listen" "$p_xhttp_proc" \
-        "$p_sub" "$p_sub_listen" "$p_sub_proc" \
+        "$p_sub" "$p_sub_listen" "$p_sub_proc" "$sub_proto" \
         "$cdn_domain" "$cdn_port" "$p_80_listen" "$p_80_proc" <<'PY'
 import sys, re, unicodedata
 
@@ -3561,10 +3922,10 @@ import sys, re, unicodedata
     p_reality, p_reality_listen, p_reality_proc,
     p_hy2, p_hy2_listen, p_hy2_proc, p_hop,
     p_xhttp, p_xhttp_listen, p_xhttp_proc,
-    p_sub, p_sub_listen, p_sub_proc,
+    p_sub, p_sub_listen, p_sub_proc, sub_proto,
     cdn_domain, cdn_port,
     p_80_listen, p_80_proc
-) = sys.argv[1:27]
+) = sys.argv[1:28]
 
 C_RESET  = '\x1b[0m'
 C_RED    = '\x1b[0;31m'
@@ -3617,7 +3978,8 @@ else:
     hop_str = f"{C_RED}{p_hop}{C_RESET}"
 
 x_port = format_port_status(p_xhttp, p_xhttp_listen, p_xhttp_proc)
-s_port = format_port_status(p_sub, p_sub_listen, p_sub_proc)
+sub_proto_tag = f" {C_GREEN}(HTTPS){C_RESET}" if sub_proto == "https" else f" {C_CYAN}(HTTP){C_RESET}"
+s_port = format_port_status(p_sub, p_sub_listen, p_sub_proc) + sub_proto_tag
 
 if p_80_listen == "1":
     proc_desc = f": {p_80_proc}" if p_80_proc else ""
@@ -4175,9 +4537,13 @@ clean_wipe_for_reinstall() {
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
         firewall-cmd --add-port=80/tcp >/dev/null 2>&1 || true
     fi
-    rm -f "${CONFIG_FILE}" "${DATA_FILE}" "${NODES_TXT}"
+    rm -f "${CONFIG_FILE}" "${DATA_FILE}" "${NODES_TXT}" "${CONFIG_DIR}/certs/sub.crt" "${CONFIG_DIR}/certs/sub.key"
     CF_CDN_DOMAIN=""
     CF_CDN_PORT=""
+    SUB_DOMAIN=""
+    SUB_HTTPS="auto"
+    HY2_MODE=1
+    HY2_DOMAIN=""
     success "历史服务已停止，端口与转发规则已全部释放。"
 }
 
@@ -4920,6 +5286,24 @@ node_port_management_menu() {
     done
 }
 
+report_cert_expiry() {
+    local label="$1"
+    local crt_file="$2"
+    local expire_date end_ts now_ts left_days
+    expire_date=$(openssl x509 -enddate -noout -in "$crt_file" 2>/dev/null | cut -d= -f2)
+    [[ -n "$expire_date" ]] || return 0
+    end_ts=$(date -d "$expire_date" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expire_date" +%s 2>/dev/null || echo 0)
+    now_ts=$(date +%s)
+    left_days=$(( (end_ts - now_ts) / 86400 ))
+    if (( left_days > 15 )); then
+        echo -e "  ├─ ${label} : ${green}✅ 正常${plain} (剩余有效期: ${left_days} 天)"
+    elif (( left_days > 0 )); then
+        echo -e "  ├─ ${label} : ${yellow}⚠️ 即将到期${plain} (剩余有效期: ${left_days} 天)"
+    else
+        echo -e "  ├─ ${label} : ${red}❌ 已过期${plain}"
+    fi
+}
+
 run_tofu_doctor() {
     clear
     show_logo
@@ -4947,10 +5331,20 @@ run_tofu_doctor() {
         echo -e "  ├─ Xray-core 守护进程 : ${red}❌ 未运行${plain} (请尝试选择主菜单 5 重启服务)"
     fi
 
+    resolve_sub_endpoint
+    local sub_proto_desc="${yellow}HTTP 基础模式${plain}"
+    [[ "$SUB_RESOLVED_PROTO" == "https" ]] && sub_proto_desc="${green}HTTPS 加密 (${SUB_RESOLVED_DOMAIN})${plain}"
     if is_sub_service_running; then
-        echo -e "  └─ 订阅 Web 服务      : ${green}● 正常运行${plain} (端口: ${SUB_PORT:-54328})"
+        echo -e "  └─ 订阅 Web 服务      : ${green}● 正常运行${plain} (端口: ${SUB_PORT:-54328}, 协议: ${sub_proto_desc})"
     else
-        echo -e "  └─ 订阅 Web 服务      : ${yellow}○ 未运行 / 已停用${plain}"
+        echo -e "  └─ 订阅 Web 服务      : ${yellow}○ 未运行 / 已停用${plain} (协议: ${sub_proto_desc})"
+    fi
+    if [[ "$SUB_RESOLVED_PROTO" == "https" && -n "$SUB_RESOLVED_DOMAIN" ]]; then
+        local sub_dns_ip
+        sub_dns_ip=$(get_domain_ip "$SUB_RESOLVED_DOMAIN")
+        if [[ -n "$sub_dns_ip" && -n "$IP" && "$sub_dns_ip" != "$IP" ]]; then
+            echo -e "     ${yellow}⚠️ 域名 ${SUB_RESOLVED_DOMAIN} 解析 IP (${sub_dns_ip}) 与本机 (${IP}) 不一致！若开启了 Cloudflare 橙色云代理，高位订阅端口 (${SUB_PORT:-54328}) 将无法连通，请改回灰云直连。${plain}"
+        fi
     fi
 
     echo -e "\n${bold}【2. 节点监听端口与网络联通】${plain}"
@@ -5013,24 +5407,19 @@ run_tofu_doctor() {
 
     echo -e "\n${bold}【4. 证书与有效期检测】${plain}"
     local hy2_crt="${CONFIG_DIR}/certs/hy2.crt"
+    local sub_crt="${CONFIG_DIR}/certs/sub.crt"
     local ecc_crt="${CONFIG_DIR}/certs/ecc.crt"
     if [[ -f "$hy2_crt" ]]; then
-        local expire_date end_ts now_ts left_days
-        expire_date=$(openssl x509 -enddate -noout -in "$hy2_crt" 2>/dev/null | cut -d= -f2)
-        if [[ -n "$expire_date" ]]; then
-            end_ts=$(date -d "$expire_date" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expire_date" +%s 2>/dev/null || echo 0)
-            now_ts=$(date +%s)
-            left_days=$(( (end_ts - now_ts) / 86400 ))
-            if (( left_days > 15 )); then
-                echo -e "  ├─ Hysteria 2 SSL 证书 (${HY2_DOMAIN:-自签}) : ${green}✅ 正常${plain} (剩余有效期: ${left_days} 天)"
-            elif (( left_days > 0 )); then
-                echo -e "  ├─ Hysteria 2 SSL 证书 (${HY2_DOMAIN:-自签}) : ${yellow}⚠️ 即将到期${plain} (剩余有效期: ${left_days} 天)"
-            else
-                echo -e "  ├─ Hysteria 2 SSL 证书 (${HY2_DOMAIN:-自签}) : ${red}❌ 已过期${plain}"
-            fi
-        fi
+        report_cert_expiry "Hysteria 2 SSL 证书 (${HY2_DOMAIN:-自签})" "$hy2_crt"
     elif [[ "$HY2_MODE" == "1" ]]; then
         echo -e "  ├─ Hysteria 2 证书模式          : ${green}✅ 自签证书 SHA256 指纹认证模式${plain}"
+    fi
+
+    if [[ -f "$sub_crt" ]]; then
+        report_cert_expiry "订阅专用 SSL 证书 (${SUB_DOMAIN:-未绑定})" "$sub_crt"
+    fi
+    if [[ "$SUB_RESOLVED_PROTO" != "https" && "$SUB_RESOLVED_REASON" != "no_domain" && "$SUB_RESOLVED_REASON" != "disabled" ]]; then
+        echo -e "  ├─ 订阅 HTTPS 状态说明          : ${yellow}⚠️ $(format_sub_fallback_reason "$SUB_RESOLVED_REASON")${plain}"
     fi
 
     if [[ -f "$ecc_crt" ]]; then
